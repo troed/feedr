@@ -317,14 +317,13 @@ pub(super) fn render_item_detail<B: Backend>(
         let search_active = search_footer_visible;
 
         let (matches, current_idx) = if search_active {
-            // Cache the rendered body and content width so `n` / `N`
-            // (handled in event dispatch) can resolve a match line back to
-            // a wrapped-row scroll target without re-deriving the body
-            // source. Re-derivation here is the source of truth — these
-            // writes happen once per frame the search is live.
+            // Cache the rendered body so `n` / `N` (handled in event
+            // dispatch) can resolve a match line back to a scroll target
+            // without re-deriving the body source. Re-derivation here is the
+            // source of truth — this write happens once per frame the search
+            // is live.
             app.article_body_cache.clear();
             app.article_body_cache.push_str(&description);
-            app.article_body_width_cache = content_width;
 
             // Recompute matches against the freshly rendered body. Clamp
             // the current-match cursor so it stays valid as the query

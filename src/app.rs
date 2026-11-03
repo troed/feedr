@@ -189,12 +189,25 @@ pub struct App {
     /// with what's drawn on screen.
     pub article_search_matches: Vec<ArticleMatch>,
     /// Cached body text fed to the detail view's `Paragraph`. Written by
-    /// the renderer every frame, read by `next_article_match` /
-    /// `prev_article_match` to compute wrapped-row scroll targets.
+    /// the renderer while in-article search is live and cleared with the
+    /// rest of the search state. The display-row map used for jumping to a
+    /// match lives in `detail_row_of_line`.
     pub article_body_cache: String,
-    /// Cached content width (post-border, post-padding) used to compute
-    /// wrapped-row positions when jumping to a match.
-    pub article_body_width_cache: usize,
+    /// Cached pre-wrapped detail body. Recomputed by the detail renderer
+    /// whenever [`App::body_key`] changes (article, content width, or
+    /// summary/full-text toggle).
+    pub detail_body_layout: Option<CachedBodyLayout>,
+    /// Display height of every image block in the current layout, indexed by
+    /// the order images appear in the article. Written by the detail
+    /// renderer as real dimensions replace the reserved estimate.
+    pub detail_image_rows: Vec<u16>,
+    /// Display row of the first screen row of each logical line, derived from
+    /// `detail_body_layout` and `detail_image_rows`. Read by
+    /// `scroll_to_current_article_match`.
+    pub detail_row_of_line: Vec<u16>,
+    /// Kitty virtual placements the detail view wants drawn this frame.
+    /// Filled by the detail renderer and consumed by `pump_images`.
+    pub visible_image_specs: Vec<crate::image::PlacementSpec>,
     /// Inline-image cache + Kitty protocol driver. Owned by `App` so the
     /// detail-view renderer can call `start_fetch` from inside ratatui's
     /// draw closure (it has `&mut App`). The actual escape emission lives
@@ -224,6 +237,28 @@ pub struct PendingImage {
     pub row: u16,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Identity of the cached detail body layout.
+///
+/// The layout depends on the article being rendered, the content width and
+/// whether the summary or the full-text body is shown, so a change to any of
+/// these must invalidate the cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyKey {
+    pub feed_url: String,
+    /// Stable per-item key: the item link, or its title when it has none.
+    pub item_key: String,
+    pub width: u16,
+    pub fulltext: bool,
+}
+
+/// A [`BodyLayout`](crate::body::BodyLayout) together with the key it was
+/// computed for.
+#[derive(Clone, Debug)]
+pub struct CachedBodyLayout {
+    pub key: BodyKey,
+    pub layout: crate::body::BodyLayout,
 }
 
 /// A single in-article search match, indexed against the rendered body's
@@ -542,7 +577,10 @@ impl App {
             article_search_current: None,
             article_search_matches: Vec::new(),
             article_body_cache: String::new(),
-            article_body_width_cache: 0,
+            detail_body_layout: None,
+            detail_image_rows: Vec::new(),
+            detail_row_of_line: Vec::new(),
+            visible_image_specs: Vec::new(),
             image_cache: crate::image::ImageCache::new(),
             pending_image_render: None,
             last_frame_had_image: false,
@@ -1615,7 +1653,6 @@ impl App {
         self.article_search_current = None;
         self.article_search_matches.clear();
         self.article_body_cache.clear();
-        self.article_body_width_cache = 0;
     }
 
     /// Advance the in-article match cursor by one and scroll the detail
@@ -1653,13 +1690,63 @@ impl App {
         };
         // Leave two rows of context above the match so the user can read
         // the paragraph it lives in, not just the match itself.
-        let row = wrapped_row_of_line(
-            &self.article_body_cache,
-            m.line,
-            self.article_body_width_cache,
-        );
+        let row = self
+            .detail_row_of_line
+            .get(m.line)
+            .copied()
+            .unwrap_or_else(|| u16::try_from(m.line).unwrap_or(u16::MAX));
         self.detail_vertical_scroll = row.saturating_sub(2);
         // Final clamp happens on the next render via `clamp_detail_scroll`.
+    }
+
+    /// Identity of the detail body layout for the focused article.
+    ///
+    /// Returns a key with empty strings when no article is focused. The
+    /// detail view never renders in that state, so the placeholder key is
+    /// never cached.
+    pub fn body_key(&self, width: u16, fulltext: bool) -> BodyKey {
+        let (feed_url, item_key) = self
+            .current_article_indices()
+            .and_then(|(feed_idx, item_idx)| {
+                let feed = self.feeds.get(feed_idx)?;
+                let item = feed.items.get(item_idx)?;
+                let item_key = item.link.clone().unwrap_or_else(|| item.title.clone());
+                Some((feed.url.clone(), item_key))
+            })
+            .unwrap_or_default();
+        BodyKey {
+            feed_url,
+            item_key,
+            width,
+            fulltext,
+        }
+    }
+
+    /// Cache a freshly computed detail body layout and derive the
+    /// logical-line → display-row map from the current image heights.
+    pub fn set_detail_layout(&mut self, key: BodyKey, layout: crate::body::BodyLayout) {
+        self.detail_row_of_line = layout.row_of_line(&self.detail_image_rows);
+        self.detail_body_layout = Some(CachedBodyLayout { key, layout });
+    }
+
+    /// Update the image block heights and re-derive `detail_row_of_line`.
+    ///
+    /// Called when an image decodes (its real aspect ratio replaces the
+    /// reserved estimate) or the terminal resizes. Scroll is clamped on the
+    /// next render.
+    pub fn set_detail_image_rows(&mut self, image_rows: Vec<u16>) {
+        self.detail_image_rows = image_rows;
+        self.recompute_detail_row_of_line();
+    }
+
+    /// Re-derive `detail_row_of_line` from the cached layout and the current
+    /// image heights without touching the layout itself.
+    fn recompute_detail_row_of_line(&mut self) {
+        self.detail_row_of_line = self
+            .detail_body_layout
+            .as_ref()
+            .map(|cached| cached.layout.row_of_line(&self.detail_image_rows))
+            .unwrap_or_default();
     }
 
     /// Check if auto-refresh should trigger
@@ -2336,34 +2423,6 @@ fn scan_line(
     }
 }
 
-/// Cumulative wrapped-row count for source lines `0..target_line_idx`.
-/// Matches the per-line walk in `count_wrapped_lines` so scroll positions
-/// remain consistent with how `Paragraph` lays out the body. Returns 0 for
-/// `target_line_idx == 0` or a zero `width`.
-pub fn wrapped_row_of_line(body: &str, target_line_idx: usize, width: usize) -> u16 {
-    if width == 0 || target_line_idx == 0 {
-        return 0;
-    }
-    let mut row: u16 = 0;
-    for (i, line) in body.split('\n').enumerate() {
-        if i >= target_line_idx {
-            break;
-        }
-        if line.is_empty() {
-            row = row.saturating_add(1);
-        } else {
-            let lw = unicode_width::UnicodeWidthStr::width(line);
-            if lw == 0 {
-                row = row.saturating_add(1);
-            } else {
-                let wrapped = lw.div_ceil(width).max(1);
-                row = row.saturating_add(wrapped as u16);
-            }
-        }
-    }
-    row
-}
-
 /// Build an `ArticleContext` directly from a `Feed` + `FeedItem` pair —
 /// the path used by `exec_on_new`, where the new item may not yet live
 /// inside `App::feeds`.
@@ -2513,6 +2572,7 @@ pub fn make_pipe_payload(ctx: &ArticleContext<'_>, kind: crate::keybindings::Std
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::layout_body;
 
     #[test]
     fn test_extract_domain_from_url() {
@@ -4083,37 +4143,133 @@ mod tests {
     }
 
     #[test]
-    fn test_wrapped_row_of_line_zero_returns_zero() {
-        let body = "one\ntwo\nthree";
-        assert_eq!(wrapped_row_of_line(body, 0, 80), 0);
+    fn scroll_to_match_uses_exact_display_row_with_images() {
+        let mut app = App::new();
+        app.set_detail_layout(
+            BodyKey {
+                feed_url: "https://example.com/feed".to_string(),
+                item_key: "https://example.com/article".to_string(),
+                width: 80,
+                fulltext: false,
+            },
+            layout_body("alpha\n\u{E000}0\u{E001}\nbeta", 80),
+        );
+        app.set_detail_image_rows(vec![12]);
+        assert_eq!(app.detail_row_of_line, vec![0, 13]);
+
+        app.article_search_matches = vec![ArticleMatch {
+            line: 1,
+            start: 0,
+            end: 4,
+        }];
+        app.article_search_current = Some(0);
+        app.scroll_to_current_article_match();
+
+        // Row 13 minus the two rows of context above the match.
+        assert_eq!(app.detail_vertical_scroll, 11);
     }
 
     #[test]
-    fn test_wrapped_row_of_line_short_lines_one_row_each() {
-        let body = "one\ntwo\nthree\nfour";
-        // Line 2 ("three") starts at row 2 — preceded by "one" (1 row) and
-        // "two" (1 row).
-        assert_eq!(wrapped_row_of_line(body, 2, 80), 2);
-        assert_eq!(wrapped_row_of_line(body, 3, 80), 3);
+    fn body_layout_cache_invalidates_on_width_item_and_fulltext() {
+        let mut app = App::new();
+        let key = BodyKey {
+            feed_url: "https://example.com/feed".to_string(),
+            item_key: "https://example.com/article".to_string(),
+            width: 80,
+            fulltext: false,
+        };
+        app.set_detail_layout(key.clone(), layout_body("alpha", 80));
+        assert_eq!(app.detail_body_layout.as_ref().unwrap().key, key);
+        assert_eq!(app.detail_row_of_line, vec![0]);
+
+        // Width change replaces the cached layout (and its rows).
+        let width_key = BodyKey {
+            width: 10,
+            ..key.clone()
+        };
+        let wrapped = layout_body("one two three four", 10);
+        app.set_detail_layout(width_key.clone(), wrapped.clone());
+        assert_eq!(app.detail_body_layout.as_ref().unwrap().key, width_key);
+        assert_eq!(
+            app.detail_body_layout.as_ref().unwrap().layout.rows,
+            wrapped.rows
+        );
+
+        // Item change replaces the cached layout.
+        let item_key = BodyKey {
+            item_key: "https://example.com/other".to_string(),
+            ..key.clone()
+        };
+        app.set_detail_layout(item_key.clone(), layout_body("beta", 80));
+        assert_eq!(app.detail_body_layout.as_ref().unwrap().key, item_key);
+
+        // Full-text toggle replaces the cached layout.
+        let fulltext_key = BodyKey {
+            fulltext: true,
+            ..key.clone()
+        };
+        app.set_detail_layout(fulltext_key.clone(), layout_body("gamma", 80));
+        assert_eq!(app.detail_body_layout.as_ref().unwrap().key, fulltext_key);
     }
 
     #[test]
-    fn test_wrapped_row_of_line_accounts_for_wrap() {
-        // 12-char line in a 5-wide viewport wraps to ceil(12/5) = 3 rows.
-        let body = "aaaaaaaaaaaa\nshort";
-        assert_eq!(wrapped_row_of_line(body, 1, 5), 3);
+    fn detail_row_of_line_recomputes_when_image_rows_change() {
+        let mut app = App::new();
+        app.set_detail_layout(
+            BodyKey {
+                feed_url: "https://example.com/feed".to_string(),
+                item_key: "https://example.com/article".to_string(),
+                width: 80,
+                fulltext: false,
+            },
+            layout_body("alpha\n\u{E000}0\u{E001}\nbeta", 80),
+        );
+
+        app.set_detail_image_rows(vec![1]);
+        assert_eq!(app.detail_row_of_line, vec![0, 2]);
+
+        app.set_detail_image_rows(vec![12]);
+        assert_eq!(app.detail_row_of_line, vec![0, 13]);
     }
 
     #[test]
-    fn test_wrapped_row_of_line_empty_width_returns_zero() {
-        assert_eq!(wrapped_row_of_line("foo\nbar", 1, 0), 0);
+    fn body_key_tracks_feed_item_and_fulltext_and_falls_back_to_title() {
+        let mut app = make_test_app();
+        app.view = View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+
+        let key = app.body_key(80, true);
+        assert_eq!(key.feed_url, "https://example.com/feed1");
+        assert_eq!(key.item_key, "https://example.com/old");
+        assert_eq!(key.width, 80);
+        assert!(key.fulltext);
+
+        // Item and feed changes each show up in the key.
+        app.selected_item = Some(1);
+        assert_eq!(app.body_key(80, false).item_key, "https://example.com/new");
+        app.selected_feed = Some(1);
+        app.selected_item = Some(0);
+        let key = app.body_key(120, false);
+        assert_eq!(key.feed_url, "https://example.com/feed2");
+        assert_eq!(key.item_key, "https://example.com/another");
+
+        // Items without a link fall back to the title.
+        app.feeds[1].items[0].link = None;
+        assert_eq!(app.body_key(120, false).item_key, "Another New");
+
+        // No focused article: empty key rather than a panic.
+        app.view = View::Dashboard;
+        app.selected_item = None;
+        let key = app.body_key(80, false);
+        assert!(key.feed_url.is_empty());
+        assert!(key.item_key.is_empty());
     }
 
     #[test]
     fn test_next_article_match_wraps_and_advances() {
         let mut app = App::new();
         app.article_body_cache = "alpha\nbeta\nalpha".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_query = "alpha".to_string();
         app.article_search_matches =
             find_article_matches(&app.article_body_cache, &app.article_search_query);
@@ -4131,7 +4287,6 @@ mod tests {
     fn test_prev_article_match_wraps_to_last() {
         let mut app = App::new();
         app.article_body_cache = "alpha\nalpha\nalpha".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_query = "alpha".to_string();
         app.article_search_matches =
             find_article_matches(&app.article_body_cache, &app.article_search_query);
@@ -4164,7 +4319,6 @@ mod tests {
             end: 3,
         }];
         app.article_body_cache = "stale body content".to_string();
-        app.article_body_width_cache = 80;
         app.clear_article_search();
         assert!(app.article_search_query.is_empty());
         assert_eq!(app.article_search_current, None);
@@ -4176,7 +4330,6 @@ mod tests {
             app.article_body_cache.is_empty(),
             "clear_article_search must drop the body cache"
         );
-        assert_eq!(app.article_body_width_cache, 0);
     }
 
     #[test]

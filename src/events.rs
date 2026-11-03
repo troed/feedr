@@ -2251,7 +2251,6 @@ mod tests {
             },
         ];
         app.article_body_cache = "foo line\nbar foo line".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_current = Some(0);
 
         let n = make_key(KeyCode::Char('n'), KeyModifiers::NONE);
@@ -2278,7 +2277,6 @@ mod tests {
             },
         ];
         app.article_body_cache = "foo line\nbar foo line".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_current = Some(1);
 
         let big_n = make_key(KeyCode::Char('N'), KeyModifiers::SHIFT);
