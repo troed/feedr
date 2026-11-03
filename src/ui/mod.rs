@@ -17,6 +17,8 @@ mod detail;
 mod feed_items;
 mod feed_list;
 mod modals;
+pub(crate) mod placeholder;
+mod rowcolumn_diacritics;
 mod starred;
 mod summary;
 pub(crate) mod utils;
