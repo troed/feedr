@@ -505,6 +505,31 @@ fn spawn_pending_extractions(
     }
 }
 
+/// Drive the inline-image cache for one frame: pin and re-place the images
+/// the detail view is about to draw, and transmit at most one image that is
+/// ready but not yet in the terminal's registry.
+///
+/// Must run *before* `terminal.draw`: a Kitty virtual placement draws nothing
+/// on its own, it only fills the cells the text buffer paints. Transmitting
+/// after the frame would leave the placeholders painted for a frame whose
+/// pixel data isn't there yet, so the image appears one frame late (or never,
+/// if the frame never re-renders).
+fn pump_images_with(app: &mut App, out: &mut impl Write) -> io::Result<()> {
+    app.image_cache.pump(out, &app.visible_image_specs)
+}
+
+/// `pump_images_with` against a locked stdout, flushed.
+///
+/// The flush is load-bearing: `terminal.draw` queues its own escapes on the
+/// same stream, and an unflushed image escape could be emitted after the
+/// placeholder cells it is meant to fill.
+fn pump_images(app: &mut App) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut locked = stdout.lock();
+    pump_images_with(app, &mut locked)?;
+    locked.flush()
+}
+
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = Duration::from_millis(app.config.ui.tick_rate);
@@ -535,6 +560,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Drain any background-fetched inline images so the next render
         // can use them. Cheap (try_recv loop, no I/O).
         app.image_cache.poll_completed();
+        // Transmit/place whatever is ready before the frame that paints the
+        // placeholder cells: a virtual placement is invisible until the text
+        // buffer draws the cells it fills.
+        pump_images(app)?;
 
         terminal.draw(|f| {
             app.update_compact_mode(f.size().height);
@@ -725,6 +754,57 @@ mod tests {
 
     fn test_terminal() -> Terminal<TestBackend> {
         Terminal::new(TestBackend::new(80, 24)).unwrap()
+    }
+
+    #[test]
+    fn pump_images_is_a_noop_on_none_protocol() {
+        let mut app = App::new();
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::None);
+        let mut out: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pump_images_transmits_ready_image_before_draw() {
+        // The TUI pumps between `poll_completed` and `terminal.draw`, so a
+        // ready image reaches the terminal before the frame that draws its
+        // placeholder cells. This exercises the helper that call site uses:
+        // one ready image + its placement spec must transmit, and the
+        // placement must be emitted in the same pass.
+        let mut app = App::new();
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::UnicodePlaceholders);
+        app.image_cache
+            .insert_ready_for_test("https://ex.com/a.png", 7, 40, 10, false);
+        app.visible_image_specs.push(crate::image::PlacementSpec {
+            url: "https://ex.com/a.png".to_string(),
+            cols: 20,
+            rows: 10,
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut out).unwrap();
+        let written = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            written.contains("a=t,f=100,t=d,i=7"),
+            "ready image must be transmitted: {written:?}"
+        );
+        assert!(
+            written.contains("a=p,U=1,i=7"),
+            "the virtual placement must accompany the transmission: {written:?}"
+        );
+
+        // The transmit budget is one image per pump and the cells did not
+        // move, so the next pump (the next frame) writes nothing.
+        let mut again: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut again).unwrap();
+        assert!(
+            again.is_empty(),
+            "second pump must not retransmit: {:?}",
+            String::from_utf8_lossy(&again)
+        );
     }
 
     #[test]
