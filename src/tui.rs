@@ -929,6 +929,7 @@ mod tests {
                     parsed_date: None,
                     plain_text: None,
                     title_lower: title.to_lowercase(),
+                    prepared_body: None,
                     media: Vec::new(),
                     thumbnail: None,
                 })

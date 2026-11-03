@@ -93,6 +93,10 @@ pub struct FeedItem {
     pub parsed_date: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub plain_text: Option<String>,
+    /// Body HTML with block images replaced by sentinel tokens, built lazily
+    /// by [`FeedItem::prepared_body`]. Recomputed on load, never persisted.
+    #[serde(skip)]
+    pub prepared_body: Option<PreparedBody>,
     #[serde(skip)]
     pub title_lower: String,
     /// Media attachments parsed from `<media:content>`, `<enclosure>`, and
@@ -116,6 +120,25 @@ impl FeedItem {
             .find(|m| matches!(m.kind, MediaKind::Audio | MediaKind::Video))
             .or_else(|| self.media.iter().find(|m| m.kind == MediaKind::Image))
             .or_else(|| self.media.first())
+    }
+
+    /// Flatten, prepare and cache the item body on first use. `base_url` is
+    /// normally `self.link`; relative image URLs resolve against it.
+    ///
+    /// Cached in `self.prepared_body` so the DOM parse and sentinel
+    /// replacement happen once per item, not once per frame. A missing
+    /// description yields an empty body.
+    pub fn prepared_body(&mut self, base_url: Option<&str>) -> &PreparedBody {
+        if self.prepared_body.is_none() {
+            let prepared = match self.description.as_deref() {
+                Some(desc) => prepare_body_html(&flatten_description_html(desc), base_url),
+                None => PreparedBody::default(),
+            };
+            self.prepared_body = Some(prepared);
+        }
+        self.prepared_body
+            .as_ref()
+            .expect("prepared body cached immediately above")
     }
 }
 
@@ -848,6 +871,7 @@ impl FeedItem {
             formatted_date,
             parsed_date,
             plain_text,
+            prepared_body: None,
             title_lower,
             media,
             thumbnail,
@@ -1182,6 +1206,18 @@ pub struct BodyImage {
 pub struct PreparedBody {
     pub html: String,
     pub images: Vec<BodyImage>,
+}
+
+impl PreparedBody {
+    /// Render the prepared HTML to text for body layout and search.
+    ///
+    /// `html2text` runs at a very wide width so it emits paragraph, list,
+    /// heading and `<br>` breaks but never hard-wraps a paragraph; the real
+    /// content width is applied later by the body layout. Sentinels are
+    /// ordinary PUA characters, so they survive this pass untouched.
+    pub(crate) fn render_text(&self) -> String {
+        html2text::from_read_with_decorator(self.html.as_bytes(), 10_000, CleanDecorator::new())
+    }
 }
 
 /// Discover block-level `<img>` tags in `flattened` (the output of
@@ -2450,6 +2486,7 @@ mod tests {
             formatted_date: None,
             parsed_date: None,
             plain_text: None,
+            prepared_body: None,
             title_lower: "t".into(),
             media: vec![
                 MediaAttachment {
@@ -2730,5 +2767,63 @@ mod tests {
         assert!(prepared.html.contains("\u{E000}0\u{E001}"));
         assert!(!prepared.html.contains("<img"));
         assert!(prepared.html.contains("body text"));
+    }
+
+    #[test]
+    fn prepared_body_render_text_keeps_sentinels_and_inline_alt() {
+        let html = r#"<p><img src="https://ex.com/a.png" alt="A"></p><p>text <img src="https://ex.com/b.png" alt="B"></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        let text = prepared.render_text();
+        assert!(text.contains('\u{E000}'));
+        assert!(text.contains("[B]"));
+        assert!(!text.contains("\u{E000}1\u{E001}"));
+    }
+
+    #[test]
+    fn feed_item_prepared_body_is_lazy_and_skipped_by_serde() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>x</title>
+    <link>https://ex.com/</link>
+    <description>x</description>
+    <item>
+      <title>Post</title>
+      <link>https://ex.com/post</link>
+      <guid>https://ex.com/post</guid>
+      <description>&lt;figure&gt;&lt;img src="https://ex.com/pics/a.png" alt="A"&gt;&lt;figcaption&gt;Cap&lt;/figcaption&gt;&lt;/figure&gt;</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let mut item = FeedItem::from_feed_entry(&entry);
+        assert!(item.prepared_body.is_none());
+        let prepared = item.prepared_body(Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("prepared_body"));
+    }
+
+    #[test]
+    fn feed_item_prepared_body_without_description_is_empty() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>x</title>
+    <link>https://ex.com/</link>
+    <description>x</description>
+    <item>
+      <title>Plain</title>
+      <link>https://ex.com/plain</link>
+      <guid>https://ex.com/plain</guid>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let mut item = FeedItem::from_feed_entry(&entry);
+        assert!(item.description.is_none());
+        let prepared = item.prepared_body(None);
+        assert!(prepared.html.is_empty());
+        assert!(prepared.images.is_empty());
     }
 }
