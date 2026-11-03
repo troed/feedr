@@ -7,9 +7,27 @@
 //! themselves: a recorded block image is just an index into the article's
 //! image list.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use unicode_width::UnicodeWidthChar;
 
 use crate::feed::{IMG_SENTINEL_END, IMG_SENTINEL_START};
+
+/// Fingerprint of a resolved body source: its display text plus the number of
+/// prepared image blocks.
+///
+/// Cached layouts compare this alongside their [`BodyKey`](crate::app::BodyKey)
+/// so a change the key cannot see \u2014 a summary text replaced by a refresh, a
+/// full-text extraction landing, or a `Ready \u2192 Failed` transition \u2014 still
+/// invalidates the layout. Callers pass the text that is actually laid out, so
+/// two sources that render identically share a layout.
+pub fn body_hash(text: &str, image_count: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    image_count.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// One display row of the body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,5 +393,22 @@ mod tests {
     fn row_of_line_accounts_for_image_blocks() {
         let layout = layout_body("alpha\n\u{E000}0\u{E001}\nbeta", 80);
         assert_eq!(layout.row_of_line(&[12]), vec![0, 13]);
+    }
+
+    #[test]
+    fn body_hash_tracks_text_and_image_count() {
+        let base = body_hash("alpha", 0);
+
+        assert_eq!(base, body_hash("alpha", 0), "identical sources must match");
+        assert_ne!(
+            base,
+            body_hash("beta", 0),
+            "a replaced summary text must change the hash"
+        );
+        assert_ne!(
+            base,
+            body_hash("alpha", 1),
+            "a changed image count must change the hash"
+        );
     }
 }

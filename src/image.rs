@@ -590,8 +590,7 @@ impl ImageCache {
     /// stdout. No-op on non-Kitty terminals.
     ///
     /// The detail view drives placements through the placeholder path now;
-    /// this remains only for `tui::emit_inline_image` until Task 10 removes
-    /// that caller (Task 11 then deletes this method and its tests).
+    /// this shim remains only for its own tests until Task 11 deletes it.
     pub fn render_at(
         &mut self,
         stdout: &mut impl Write,

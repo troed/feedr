@@ -269,6 +269,11 @@ pub fn render<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     // Use the cached color scheme from app state
     let colors = app.color_scheme.clone();
 
+    // Placement specs are rebuilt by the detail view every frame. Clear any
+    // specs left by the previous frame (or by another view) so a stale image
+    // is never pumped after the user navigates away.
+    app.visible_image_specs.clear();
+
     // Set background color for the entire terminal
     let bg_block = Block::default().style(Style::default().bg(colors.background));
     f.render_widget(bg_block, f.size());
@@ -356,28 +361,6 @@ pub fn render<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     // Show help overlay on top of everything
     if app.show_help_overlay {
         render_help_overlay(f, app, &colors);
-    }
-
-    // Inline-image vs modal z-order: the Kitty escapes are emitted *after*
-    // `terminal.draw()` returns, so they would paint on top of any modal
-    // rendered above. Suppress the image on frames where a modal is
-    // visible (mirroring the conditions above); the run loop's clear-all /
-    // re-place cycle restores it when the modal closes. The success
-    // notification is deliberately excluded — it renders inside the
-    // title-bar region and cannot overlap the image strip.
-    let modal_visible = app.error.is_some()
-        || matches!(
-            app.input_mode,
-            InputMode::InsertUrl
-                | InputMode::SearchMode
-                | InputMode::SelectDiscoveredFeed
-                | InputMode::CategoryNameInput
-        )
-        || app.filter_mode
-        || app.show_link_overlay
-        || app.show_help_overlay;
-    if modal_visible {
-        app.pending_image_render = None;
     }
 }
 

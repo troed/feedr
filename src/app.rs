@@ -206,44 +206,21 @@ pub struct App {
     /// `scroll_to_current_article_match`.
     pub detail_row_of_line: Vec<u16>,
     /// Kitty virtual placements the detail view wants drawn this frame.
-    /// Filled by the detail renderer and consumed by `pump_images`.
+    /// Filled by the detail renderer and consumed by the image pump.
     pub visible_image_specs: Vec<crate::image::PlacementSpec>,
     /// Inline-image cache + Kitty protocol driver. Owned by `App` so the
-    /// detail-view renderer can call `start_fetch` from inside ratatui's
-    /// draw closure (it has `&mut App`). The actual escape emission lives
-    /// in `run_app` after `terminal.draw()` returns — see
-    /// `pending_image_render`.
+    /// detail-view renderer can queue fetches from inside ratatui's draw
+    /// closure (it has `&mut App`).
     pub image_cache: crate::image::ImageCache,
-    /// Set by the detail-view renderer each frame when an image is loaded
-    /// and ready to draw. Consumed once by `run_app` immediately after
-    /// `terminal.draw()` returns — the run loop emits Kitty placement
-    /// escapes for this rect, then clears the slot. None on every frame
-    /// where no image should be shown (no thumbnail, not on detail view,
-    /// fetch in-flight, fetch failed).
-    pub pending_image_render: Option<PendingImage>,
-    /// True iff the previous frame *was* showing an inline image. Used by
-    /// `run_app` to detect view-change → emit Kitty delete-all so the
-    /// image doesn't bleed onto the next view's cells.
-    pub last_frame_had_image: bool,
-}
-
-/// Detail-view → run_app message: "after the next `terminal.draw()` returns,
-/// place image `url` inside the rect `(col, row, cols, rows)`." Coordinates
-/// are 0-based terminal cells (matching ratatui's `Rect` semantics).
-#[derive(Clone, Debug)]
-pub struct PendingImage {
-    pub url: String,
-    pub col: u16,
-    pub row: u16,
-    pub cols: u16,
-    pub rows: u16,
 }
 
 /// Identity of the cached detail body layout.
 ///
 /// The layout depends on the article being rendered, the content width and
 /// whether the summary or the full-text body is shown, so a change to any of
-/// these must invalidate the cache.
+/// these must invalidate the cache. A source change those fields cannot see
+/// (refresh replacing the summary, extraction landing) is caught by the
+/// `body_hash` on [`CachedBodyLayout`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyKey {
     pub feed_url: String,
@@ -253,12 +230,23 @@ pub struct BodyKey {
     pub fulltext: bool,
 }
 
-/// A [`BodyLayout`](crate::body::BodyLayout) together with the key it was
-/// computed for.
+/// A [`BodyLayout`](crate::body::BodyLayout) together with the key and body
+/// fingerprint it was computed for.
 #[derive(Clone, Debug)]
 pub struct CachedBodyLayout {
     pub key: BodyKey,
+    /// [`crate::body::body_hash`] of the resolved display text plus image
+    /// count. Compared on every render so a body-source change rebuilds the
+    /// layout even when `key` is unchanged.
+    pub body_hash: u64,
     pub layout: crate::body::BodyLayout,
+}
+
+impl CachedBodyLayout {
+    /// True when this cache entry is still valid for `key` and `body_hash`.
+    pub fn matches(&self, key: &BodyKey, body_hash: u64) -> bool {
+        self.key == *key && self.body_hash == body_hash
+    }
 }
 
 /// A single in-article search match, indexed against the rendered body's
@@ -582,8 +570,6 @@ impl App {
             detail_row_of_line: Vec::new(),
             visible_image_specs: Vec::new(),
             image_cache: crate::image::ImageCache::new(),
-            pending_image_render: None,
-            last_frame_had_image: false,
         };
 
         app.update_dashboard();
@@ -1724,9 +1710,22 @@ impl App {
 
     /// Cache a freshly computed detail body layout and derive the
     /// logical-line → display-row map from the current image heights.
-    pub fn set_detail_layout(&mut self, key: BodyKey, layout: crate::body::BodyLayout) {
+    ///
+    /// `body_hash` is [`crate::body::body_hash`] of the text and image count
+    /// that produced `layout`; [`CachedBodyLayout::matches`] compares it
+    /// alongside the key on subsequent renders.
+    pub fn set_detail_layout(
+        &mut self,
+        key: BodyKey,
+        body_hash: u64,
+        layout: crate::body::BodyLayout,
+    ) {
         self.detail_row_of_line = layout.row_of_line(&self.detail_image_rows);
-        self.detail_body_layout = Some(CachedBodyLayout { key, layout });
+        self.detail_body_layout = Some(CachedBodyLayout {
+            key,
+            body_hash,
+            layout,
+        });
     }
 
     /// Update the image block heights and re-derive `detail_row_of_line`.
@@ -2572,7 +2571,7 @@ pub fn make_pipe_payload(ctx: &ArticleContext<'_>, kind: crate::keybindings::Std
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::layout_body;
+    use crate::body::{body_hash, layout_body};
 
     #[test]
     fn test_extract_domain_from_url() {
@@ -4152,6 +4151,7 @@ mod tests {
                 width: 80,
                 fulltext: false,
             },
+            body_hash("alpha\n\u{E000}0\u{E001}\nbeta", 1),
             layout_body("alpha\n\u{E000}0\u{E001}\nbeta", 80),
         );
         app.set_detail_image_rows(vec![12]);
@@ -4178,7 +4178,7 @@ mod tests {
             width: 80,
             fulltext: false,
         };
-        app.set_detail_layout(key.clone(), layout_body("alpha", 80));
+        app.set_detail_layout(key.clone(), body_hash("alpha", 0), layout_body("alpha", 80));
         assert_eq!(app.detail_body_layout.as_ref().unwrap().key, key);
         assert_eq!(app.detail_row_of_line, vec![0]);
 
@@ -4188,7 +4188,11 @@ mod tests {
             ..key.clone()
         };
         let wrapped = layout_body("one two three four", 10);
-        app.set_detail_layout(width_key.clone(), wrapped.clone());
+        app.set_detail_layout(
+            width_key.clone(),
+            body_hash("one two three four", 0),
+            wrapped.clone(),
+        );
         assert_eq!(app.detail_body_layout.as_ref().unwrap().key, width_key);
         assert_eq!(
             app.detail_body_layout.as_ref().unwrap().layout.rows,
@@ -4200,7 +4204,11 @@ mod tests {
             item_key: "https://example.com/other".to_string(),
             ..key.clone()
         };
-        app.set_detail_layout(item_key.clone(), layout_body("beta", 80));
+        app.set_detail_layout(
+            item_key.clone(),
+            body_hash("beta", 0),
+            layout_body("beta", 80),
+        );
         assert_eq!(app.detail_body_layout.as_ref().unwrap().key, item_key);
 
         // Full-text toggle replaces the cached layout.
@@ -4208,8 +4216,38 @@ mod tests {
             fulltext: true,
             ..key.clone()
         };
-        app.set_detail_layout(fulltext_key.clone(), layout_body("gamma", 80));
+        app.set_detail_layout(
+            fulltext_key.clone(),
+            body_hash("gamma", 0),
+            layout_body("gamma", 80),
+        );
         assert_eq!(app.detail_body_layout.as_ref().unwrap().key, fulltext_key);
+    }
+
+    #[test]
+    fn cached_body_layout_matches_key_and_body_hash() {
+        let key = BodyKey {
+            feed_url: "https://example.com/feed".to_string(),
+            item_key: "https://example.com/article".to_string(),
+            width: 80,
+            fulltext: false,
+        };
+        let cached = CachedBodyLayout {
+            key: key.clone(),
+            body_hash: body_hash("alpha", 0),
+            layout: layout_body("alpha", 80),
+        };
+
+        assert!(cached.matches(&key, body_hash("alpha", 0)));
+        // Same article and width, but the summary text changed (refresh) or
+        // the extraction state flipped: the body hash must reject the cache.
+        assert!(!cached.matches(&key, body_hash("beta", 0)));
+        assert!(!cached.matches(&key, body_hash("alpha", 1)));
+        let width_key = BodyKey {
+            width: 10,
+            ..key.clone()
+        };
+        assert!(!cached.matches(&width_key, body_hash("alpha", 0)));
     }
 
     #[test]
@@ -4222,6 +4260,7 @@ mod tests {
                 width: 80,
                 fulltext: false,
             },
+            body_hash("alpha\n\u{E000}0\u{E001}\nbeta", 1),
             layout_body("alpha\n\u{E000}0\u{E001}\nbeta", 80),
         );
 
@@ -4406,7 +4445,8 @@ mod tests {
         // Multi-byte char ("é" = 2 bytes in UTF-8) sits in the line before
         // the ASCII match. The reported byte offsets must land on UTF-8
         // boundaries in the *original* line, not just the folded one, so
-        // that `&line[start..end]` slicing in `build_styled_body` is safe.
+        // that `&line[start..end]` slicing in the detail renderer's
+        // highlight spans is safe.
         let body = "café bar foo baz";
         // bytes: c(0) a(1) f(2) é(3..5) ' '(5) b(6) a(7) r(8) ' '(9) f(10) o(11) o(12)
         let matches = find_article_matches(body, "foo");
