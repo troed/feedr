@@ -494,7 +494,8 @@ impl ImageCache {
             };
             // Upper bound on what the encoder will produce for this payload.
             let encoded_len = base64::encoded_len(png.len(), true).unwrap_or(usize::MAX);
-            if written_bytes > 0 && written_bytes.saturating_add(encoded_len) > TRANSMIT_BUDGET_BYTES
+            if written_bytes > 0
+                && written_bytes.saturating_add(encoded_len) > TRANSMIT_BUDGET_BYTES
             {
                 break;
             }
