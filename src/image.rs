@@ -1,15 +1,19 @@
-//! Inline image rendering via the Kitty graphics protocol.
+//! Inline image cache and Kitty graphics-protocol driver.
 //!
-//! Scope (MVP): a single image per article, placed in a reserved strip of
-//! the detail view. Background fetch via a worker thread pool. Decoded into
-//! `image::DynamicImage`, downscaled, re-encoded as PNG, base64-encoded,
-//! and transmitted to the terminal in 4096-byte chunks per the Kitty spec.
+//! Scope: every block-level image in an article body is rendered inline at
+//! its position (see `docs/superpowers/specs/2026-11-03-inline-images-design.md`).
+//! Images are fetched in the background by a bounded worker pool, decoded,
+//! downscaled and **re-encoded to PNG** in the worker; the main thread never
+//! holds decoded pixels. The cache stores one entry per URL:
+//!
+//! ```text
+//! absent → InFlight → Ready { image, png } → (png taken on transmit)
+//!                  ↘ Failed
+//! ```
 //!
 //! Non-goals (deliberate):
-//!   * iTerm2 / Sixel / Terminology / half-block fallbacks. In terminals
-//!     without Kitty support the image area silently stays blank.
-//!   * Multiple inline images per article. The article's `thumbnail` field
-//!     is the single source surfaced.
+//!   * iTerm2 / Sixel / Terminology / half-block fallbacks. Terminals
+//!     without Kitty graphics support get alt text instead.
 //!   * tmux DCS passthrough. Skip until a user actually needs it.
 //!   * Cell-pixel-size ioctl. A fixed aspect approximation gives perfectly
 //!     usable thumbnails; precision can come later.
@@ -25,9 +29,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::{mpsc, Arc};
 
-/// Concurrency cap for background fetches. Detail-view ever needs one
-/// image at a time, but a quick navigate-spam from the user can queue
-/// multiple — bound it so a hostile feed can't fan-out a connection burst.
+/// Concurrency cap for background fetches. A viewport prefetch can ask for
+/// several images at once, and a quick navigate-spam can queue more —
+/// bound it so a hostile feed can't fan-out a connection burst.
 const MAX_CONCURRENT_FETCHES: usize = 4;
 
 /// Hard cap on the body size of an image fetch. Anything larger is treated
@@ -46,10 +50,11 @@ const MAX_SOURCE_DIM: u32 = 1024;
 const MAX_DECODE_DIM: u32 = 8192;
 const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
 
-/// LRU cap on decoded images. Each slot can hold up to
-/// `MAX_SOURCE_DIM`² RGBA (~4 MB), so the cache is bounded at ~128 MB
-/// worst-case instead of growing for the life of the process. Same
-/// insertion-order eviction pattern as `App::extracted`.
+/// LRU cap on cached entries. Each entry holds at most one encoded PNG
+/// (bounded by `MAX_SOURCE_DIM`² at the worst case), so the cache stays
+/// small for the life of the process. URLs pinned by the currently
+/// displayed article are never evicted; if all of them are pinned the
+/// cache may grow past the cap, bounded by the 40-image article cap.
 const MAX_CACHED_IMAGES: usize = 32;
 
 /// Heuristic ratio of (cell width / cell height) in pixels. Most modern
@@ -71,7 +76,7 @@ pub enum ImageProtocol {
 pub fn detect_protocol() -> ImageProtocol {
     // tmux inherits KITTY_WINDOW_ID / TERM_PROGRAM from the outer terminal
     // but swallows raw APC sequences (no passthrough support here yet), so
-    // the image would never appear while the strip still gets reserved.
+    // the image would never appear.
     if std::env::var_os("TMUX").is_some() {
         return ImageProtocol::None;
     }
@@ -94,62 +99,87 @@ pub fn detect_protocol() -> ImageProtocol {
     ImageProtocol::None
 }
 
-/// A PNG blob ready for Kitty transmission, with the dimensions needed to
-/// position the placement.
+/// A cached image whose PNG is ready to transmit, with the source
+/// dimensions needed to size its placement.
 #[derive(Clone, Debug)]
-struct KittyImage {
-    /// 24-bit Kitty image id. Reserved between transmit and place.
-    id: u32,
-    /// Pre-encoded PNG bytes, transmitted once on first render and dropped.
-    pending_png: Option<Arc<Vec<u8>>>,
+pub struct ReadyImage {
+    /// 24-bit Kitty image id, allocated when the fetch result is inserted.
+    pub id: u32,
+    /// Source width in pixels, after downscaling.
+    pub width: u32,
+    /// Source height in pixels, after downscaling.
+    pub height: u32,
     /// Whether the PNG has been transmitted to the terminal. Once true,
-    /// subsequent renders just emit placement escapes (cheap).
-    transmitted: bool,
-    /// Source-image aspect (width / height) — needed to size the placement
-    /// in cells against the available rect.
-    src_aspect: f32,
+    /// re-rendering only emits a placement escape (cheap).
+    pub transmitted: bool,
+}
+
+/// Read-only view of the cache for a URL. Callers use this to pick the
+/// right placeholder rows without ever seeing decoded pixels.
+#[derive(Debug)]
+pub enum ImageView<'a> {
+    /// The URL has never been requested.
+    Missing,
+    /// A background fetch is queued or running.
+    Loading,
+    /// The PNG is available (possibly not yet transmitted).
+    Ready(&'a ReadyImage),
+    /// The fetch failed permanently for this session.
+    Failed,
+}
+
+/// One cache slot per URL.
+enum Entry {
+    InFlight,
+    /// `png` is `Some` until the first transmission takes it.
+    Ready {
+        image: ReadyImage,
+        png: Option<Arc<Vec<u8>>>,
+    },
+    Failed,
+}
+
+/// A worker result: the downscaled image already encoded as PNG. The
+/// decoded `DynamicImage` is dropped inside the worker.
+struct EncodedImage {
+    png: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 /// Per-process inline-image cache + Kitty protocol driver.
 ///
-/// State machine for a given URL:
-///   absent → in_flight (worker queued) → images: Some(img) (decoded)
-///   → kitty_images: Some(KittyImage) (PNG-ready)
-///   → on first render: transmitted=true (PNG sent to terminal)
-///
-/// A failed fetch lands as `images: None` (insert-known-failed); subsequent
-/// `start_fetch` calls for that URL no-op. Deliberately permanent (no
-/// retry, no TTL) until the slot ages out of the LRU: a transient network
-/// blip costs that article its thumbnail for the session, in exchange for
-/// never re-hitting a dead URL at render frequency. Revisit if users
-/// report chronically missing thumbnails.
+/// A failed fetch lands as `Entry::Failed`; subsequent `start_fetch` calls
+/// for that URL no-op. Deliberately permanent (no retry, no TTL) until the
+/// slot ages out of the LRU: a transient network blip costs that article
+/// its image for the session, in exchange for never re-hitting a dead URL
+/// at render frequency. Revisit if users report chronically missing
+/// images.
 ///
 /// Debug is implemented manually because the internal `mpsc::Receiver`
 /// has no `Debug` impl — we surface counts instead of contents.
 pub struct ImageCache {
     protocol: ImageProtocol,
-    /// Decoded images. `None` slot = fetch attempted and failed.
-    images: HashMap<String, Option<Arc<DynamicImage>>>,
-    /// Insertion order for `images`, oldest first. Drives LRU eviction at
-    /// `MAX_CACHED_IMAGES` — see `insert_image`.
-    images_order: VecDeque<String>,
-    /// PNG-ready Kitty payloads. Only populated when `protocol == Kitty`.
-    kitty_images: HashMap<String, Option<KittyImage>>,
+    /// Encoded images and fetch state, keyed by URL.
+    entries: HashMap<String, Entry>,
+    /// Insertion order for `entries`, oldest first. Drives LRU eviction at
+    /// `MAX_CACHED_IMAGES` — see `insert_entry`.
+    order: VecDeque<String>,
+    /// URLs referenced by the currently displayed article. Never evicted.
+    pinned: HashSet<String>,
     /// Monotonic Kitty image id allocator. Skips 0 (reserved by spec).
     next_kitty_id: u32,
     /// Background fetch channel + bookkeeping.
-    sender: mpsc::Sender<(String, Option<DynamicImage>)>,
-    receiver: mpsc::Receiver<(String, Option<DynamicImage>)>,
+    sender: mpsc::Sender<(String, Option<EncodedImage>)>,
+    receiver: mpsc::Receiver<(String, Option<EncodedImage>)>,
     in_flight: HashSet<String>,
-    /// Lazily-built HTTP client. Kept here so the detail-view renderer can
-    /// trigger fetches via `&mut App` without the caller threading a client
+    /// Lazily-built HTTP client. Kept here so the renderer can trigger
+    /// fetches via `&mut App` without the caller threading a client
     /// through every UI layer. Construction is cheap relative to a fetch.
     client: Option<reqwest::blocking::Client>,
     /// Kitty image id of the placement currently on screen, if any.
-    /// `render_at` deletes the previous placement when the id changes —
-    /// placements are keyed by (image id, placement id), so re-using
-    /// `p=1` across *different* image ids would otherwise stack both
-    /// images in the strip.
+    /// Retained by the transitional single-placement shim (`render_at`);
+    /// removed once the detail view drives placements through `pump`.
     last_placed_id: Option<u32>,
     /// Kitty ids whose terminal-side pixel data should be freed (their
     /// URL was evicted from our cache, so we'd never place them again).
@@ -168,8 +198,8 @@ impl std::fmt::Debug for ImageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageCache")
             .field("protocol", &self.protocol)
-            .field("images", &self.images.len())
-            .field("kitty_images", &self.kitty_images.len())
+            .field("entries", &self.entries.len())
+            .field("pinned", &self.pinned.len())
             .field("in_flight", &self.in_flight.len())
             .finish()
     }
@@ -180,9 +210,9 @@ impl ImageCache {
         let (sender, receiver) = mpsc::channel();
         Self {
             protocol: detect_protocol(),
-            images: HashMap::new(),
-            images_order: VecDeque::new(),
-            kitty_images: HashMap::new(),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            pinned: HashSet::new(),
             next_kitty_id: 0,
             sender,
             receiver,
@@ -204,45 +234,51 @@ impl ImageCache {
         self.protocol = protocol;
     }
 
-    /// True iff a decoded image is ready for this URL (independent of
-    /// whether the Kitty PNG has been transmitted yet — that's lazy).
+    /// Read-only state for `url`.
+    pub fn view(&self, url: &str) -> ImageView<'_> {
+        match self.entries.get(url) {
+            None => ImageView::Missing,
+            Some(Entry::InFlight) => ImageView::Loading,
+            Some(Entry::Ready { image, .. }) => ImageView::Ready(image),
+            Some(Entry::Failed) => ImageView::Failed,
+        }
+    }
+
+    /// True iff an encoded image is ready for this URL (independent of
+    /// whether the PNG has been transmitted yet — that's lazy).
     pub fn has_image(&self, url: &str) -> bool {
-        self.images.get(url).is_some_and(|o| o.is_some())
+        matches!(self.view(url), ImageView::Ready(_))
     }
 
-    /// Record a fetch result (decoded image or known failure), evicting the
-    /// oldest entry past `MAX_CACHED_IMAGES`. Eviction also drops the
-    /// matching Kitty payload so stale PNG state can't outlive its image;
-    /// an evicted-but-displayed URL simply re-fetches on the next render.
-    /// Transmitted ids of dropped payloads are queued so the *terminal's*
-    /// copy of the pixel data is freed too (see `pending_deletes`).
-    pub(crate) fn insert_image(&mut self, url: String, img: Option<Arc<DynamicImage>>) {
-        if self.images.insert(url.clone(), img).is_some() {
-            // Overwrite (e.g. a retried known-failure): the old Kitty
-            // payload no longer matches the new image.
-            self.drop_kitty_payload(&url);
-        } else {
-            self.images_order.push_back(url);
-        }
-        while self.images_order.len() > MAX_CACHED_IMAGES {
-            if let Some(oldest) = self.images_order.pop_front() {
-                self.images.remove(&oldest);
-                self.drop_kitty_payload(&oldest);
-            }
+    /// Compute the (cols, rows) the image should occupy when constrained
+    /// to `(max_cols, max_rows)` cells, preserving the image's aspect.
+    /// Returns None if the image isn't ready yet.
+    pub fn display_cells(&self, url: &str, max_cols: usize, max_rows: usize) -> Option<(u16, u16)> {
+        match self.view(url) {
+            ImageView::Ready(img) => Some(fit_cells(img.width, img.height, max_cols, max_rows)),
+            _ => None,
         }
     }
 
-    /// Remove the Kitty payload for `url`; if its PNG was already
-    /// transmitted, queue a terminal-side data delete for the next flush.
-    fn drop_kitty_payload(&mut self, url: &str) {
-        if let Some(Some(ki)) = self.kitty_images.remove(url) {
-            if ki.transmitted {
-                self.pending_deletes.push(ki.id);
-            }
+    /// Queue background fetches for every URL that isn't already known.
+    /// `start_fetch` enforces the concurrency cap and the permanent-failure
+    /// semantics, so calling this every frame is cheap.
+    pub fn ensure_fetches(&mut self, urls: &[String]) {
+        for url in urls {
+            // A `false` return means the cap was hit (or a thread could not
+            // be spawned); both are transient, so the next tick retries.
+            self.start_fetch(url);
         }
     }
 
-    /// Queue a background fetch+decode for `url`. Returns false if the
+    /// Pin `urls` (the currently displayed article's images) so LRU
+    /// eviction leaves them alone.
+    pub fn set_pinned(&mut self, urls: HashSet<String>) {
+        self.pinned = urls;
+        self.evict_lru();
+    }
+
+    /// Queue a background fetch+encode for `url`. Returns false if the
     /// fetch could not be started right now (concurrency cap full, or OS
     /// thread creation failed) — both are transient, and the caller can
     /// re-queue on the next tick.
@@ -252,7 +288,7 @@ impl ImageCache {
         if self.protocol == ImageProtocol::None {
             return true; // no point fetching if we can't render
         }
-        if self.images.contains_key(url) || self.in_flight.contains(url) {
+        if self.entries.contains_key(url) || self.in_flight.contains(url) {
             return true;
         }
         if self.in_flight.len() >= MAX_CONCURRENT_FETCHES {
@@ -260,26 +296,25 @@ impl ImageCache {
         }
         if !crate::feed::is_safe_auto_url(url) {
             // Treat blocked hosts as a known failure so we don't re-queue.
-            self.insert_image(url.to_string(), None);
+            self.insert_entry(url.to_string(), Entry::Failed);
             return true;
         }
         // Lazily build the client. Failure here is treated as a known-failed
         // fetch so we don't re-queue on every render tick. The safe-redirect
-        // client re-runs `is_safe_auto_url` on every hop — thumbnails come
-        // from hostile feed content and are fetched with no user action, so
-        // a public-looking URL must not be allowed to 302 into the user's
+        // client re-runs `is_safe_auto_url` on every hop — images come from
+        // hostile feed content and are fetched with no user action, so a
+        // public-looking URL must not be allowed to 302 into the user's
         // internal network (same threat model as the auto-fulltext path).
         if self.client.is_none() {
             match crate::feed::Feed::build_safe_redirect_client(15) {
                 Ok(c) => self.client = Some(c),
                 Err(_) => {
-                    self.insert_image(url.to_string(), None);
+                    self.insert_entry(url.to_string(), Entry::Failed);
                     return true;
                 }
             }
         }
         let client = self.client.as_ref().unwrap().clone();
-        self.in_flight.insert(url.to_string());
         let sender = self.sender.clone();
         let url_owned = url.to_string();
         // Builder::spawn (not thread::spawn) so an OS thread-creation
@@ -291,84 +326,104 @@ impl ImageCache {
                 // Panic-safe: a panic in the image decoder must still free the
                 // in-flight slot via `poll_completed`. Without `catch_unwind`,
                 // a single hostile image could permanently strand the slot.
-                let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fetch_and_decode(&url_owned, &client)
+                let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_encode_and_decode(&url_owned, &client)
                 }))
                 .unwrap_or(None);
-                let _ = sender.send((url_owned, img));
+                let _ = sender.send((url_owned, encoded));
             });
         if spawned.is_err() {
-            // Transient resource exhaustion: release the slot so a later
-            // render can retry rather than caching a permanent failure.
+            // Transient resource exhaustion: don't record an entry so a
+            // later render can retry rather than caching a permanent failure.
             self.in_flight.remove(url);
             return false;
         }
+        self.in_flight.insert(url.to_string());
+        // Mark the entry only after a successful spawn so a failed spawn
+        // leaves the URL in the `Missing` state.
+        self.insert_entry(url.to_string(), Entry::InFlight);
         true
     }
 
-    /// Drain completed background fetches. Returns true if any new images
+    /// Drain completed background fetches. Returns true if any new results
     /// arrived (so the caller can request a redraw).
     pub fn poll_completed(&mut self) -> bool {
         let mut any = false;
-        while let Ok((url, img)) = self.receiver.try_recv() {
+        while let Ok((url, encoded)) = self.receiver.try_recv() {
             self.in_flight.remove(&url);
-            self.insert_image(url, img.map(Arc::new));
+            let entry = match encoded {
+                Some(EncodedImage { png, width, height }) => {
+                    // Allocate the id once, when the PNG becomes available.
+                    let id = self.allocate_kitty_id();
+                    Entry::Ready {
+                        image: ReadyImage {
+                            id,
+                            width,
+                            height,
+                            transmitted: false,
+                        },
+                        png: Some(Arc::new(png)),
+                    }
+                }
+                None => Entry::Failed,
+            };
+            self.insert_entry(url, entry);
             any = true;
         }
         any
     }
 
-    /// Compute the (cols, rows) the image should occupy when constrained
-    /// to `(max_cols, max_rows)` cells, preserving the image's aspect.
-    /// Returns None if the image isn't loaded yet.
-    pub fn display_cells(&self, url: &str, max_cols: usize, max_rows: usize) -> Option<(u16, u16)> {
-        let img = self.images.get(url)?.as_ref()?;
-        let (w, h) = img.dimensions();
-        Some(fit_cells(w, h, max_cols, max_rows))
-    }
-
-    /// Pre-encode the PNG for `url` if needed, ready to transmit. Called
-    /// from `render_at` on first use of an image.
-    fn ensure_kitty_ready(&mut self, url: &str) -> bool {
-        if self.protocol != ImageProtocol::Kitty {
-            return false;
-        }
-        if let Some(ki) = self.kitty_images.get(url) {
-            return ki.is_some();
-        }
-        let img = match self.images.get(url).and_then(|o| o.as_ref()) {
-            Some(img) => img,
-            None => return false,
-        };
-        let png = match encode_png(img) {
-            Some(p) => p,
-            None => {
-                self.kitty_images.insert(url.to_string(), None);
-                return false;
-            }
-        };
+    /// Next 24-bit Kitty image id. 0 is reserved by the spec.
+    fn allocate_kitty_id(&mut self) -> u32 {
         self.next_kitty_id = self.next_kitty_id.wrapping_add(1);
-        // 24-bit range; ID 0 is reserved by the spec.
         if self.next_kitty_id == 0 || self.next_kitty_id > 0x00FF_FFFF {
             self.next_kitty_id = 1;
         }
-        let (w, h) = img.dimensions();
-        let src_aspect = if h == 0 { 1.0 } else { w as f32 / h as f32 };
-        self.kitty_images.insert(
-            url.to_string(),
-            Some(KittyImage {
-                id: self.next_kitty_id,
-                pending_png: Some(Arc::new(png)),
-                transmitted: false,
-                src_aspect,
-            }),
-        );
-        true
+        self.next_kitty_id
     }
 
-    /// Place the image for `url` at the top-left of `rect`, sized to fit
-    /// within `rect`. Returns true if anything was written to stdout.
-    /// No-op on non-Kitty terminals.
+    /// Record an entry, then trim the LRU. Overwriting an existing entry
+    /// (e.g. `InFlight` → `Ready`) keeps its original recency slot.
+    fn insert_entry(&mut self, url: String, entry: Entry) {
+        if self.entries.insert(url.clone(), entry).is_none() {
+            self.order.push_back(url);
+        }
+        self.evict_lru();
+    }
+
+    /// Drop the oldest unpinned entries until the cache is back at
+    /// `MAX_CACHED_IMAGES`. If every entry is pinned the cache is allowed
+    /// to grow (bounded by the 40-image article cap).
+    fn evict_lru(&mut self) {
+        while self.entries.len() > MAX_CACHED_IMAGES {
+            let Some(idx) = self.order.iter().position(|u| !self.pinned.contains(u)) else {
+                break;
+            };
+            let Some(url) = self.order.remove(idx) else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&url) {
+                self.drop_entry(entry);
+            }
+        }
+    }
+
+    /// Queue a terminal-side `d=I` for an entry whose PNG was transmitted.
+    fn drop_entry(&mut self, entry: Entry) {
+        if let Entry::Ready { image, .. } = entry {
+            if image.transmitted {
+                self.pending_deletes.push(image.id);
+            }
+        }
+    }
+
+    /// **Transitional shim.** Place `url` at the top-left of `rect`, sized
+    /// to fit within `rect`. Returns true if anything was written to
+    /// stdout. No-op on non-Kitty terminals.
+    ///
+    /// The detail view drives placements through the placeholder path now;
+    /// this remains only for `tui::emit_inline_image` until Task 10 removes
+    /// that caller (Task 11 then deletes this method and its tests).
     pub fn render_at(
         &mut self,
         stdout: &mut impl Write,
@@ -381,20 +436,15 @@ impl ImageCache {
         if self.protocol != ImageProtocol::Kitty {
             return Ok(false);
         }
-        if !self.ensure_kitty_ready(url) {
-            return Ok(false);
-        }
+        let (id, width, height) = match self.view(url) {
+            ImageView::Ready(img) => (img.id, img.width, img.height),
+            _ => return Ok(false),
+        };
         // Free terminal-side data for any ids evicted since the last write.
         self.flush_pending_deletes(stdout)?;
-        let last_placed = self.last_placed_id;
-        let ki = match self.kitty_images.get_mut(url).and_then(|o| o.as_mut()) {
-            Some(ki) => ki,
-            None => return Ok(false),
-        };
 
         // Size the placement: respect both rect bounds AND image aspect.
-        let (cols, rows) =
-            fit_cells_with_aspect(ki.src_aspect, max_cols as usize, max_rows as usize);
+        let (cols, rows) = fit_cells(width, height, max_cols as usize, max_rows as usize);
         if cols == 0 || rows == 0 {
             return Ok(false);
         }
@@ -404,20 +454,33 @@ impl ImageCache {
         // independent of which Writer the caller uses (stdout, BufWriter…).
         write!(stdout, "\x1b[{};{}H", rect_row + 1, rect_col + 1)?;
 
-        if !ki.transmitted {
-            if let Some(png) = ki.pending_png.take() {
-                transmit_kitty_image(stdout, &png, ki.id)?;
+        let pending_png = match self.entries.get_mut(url) {
+            Some(Entry::Ready { image, png }) => {
+                if image.transmitted {
+                    None
+                } else {
+                    // `Some(None)` = ready to transmit, no payload attached
+                    // (only reachable for test-injected entries).
+                    Some(png.take())
+                }
             }
-            ki.transmitted = true;
+            _ => return Ok(false),
+        };
+        if let Some(png) = pending_png {
+            let bytes: &[u8] = png.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+            transmit_kitty_image(stdout, bytes, id)?;
+            if let Some(Entry::Ready { image, .. }) = self.entries.get_mut(url) {
+                image.transmitted = true;
+            }
         }
-        let id = ki.id;
+
         // Placements are keyed by (image id, placement id). Re-placing the
         // SAME image id with p=1 replaces the previous placement, but a
         // DIFFERENT image id would stack on top of the old one — so when
         // switching images within a frame-pair, delete the old image's
         // placement first (d=i, lowercase: placement only, its pixel data
         // stays cached terminal-side for a cheap re-place later).
-        if let Some(old) = last_placed {
+        if let Some(old) = self.last_placed_id {
             if old != id {
                 write!(stdout, "\x1b_Ga=d,d=i,i={},q=2\x1b\\", old)?;
             }
@@ -430,16 +493,15 @@ impl ImageCache {
         Ok(true)
     }
 
-    /// Tell the terminal to drop every Kitty *placement* (`d=a`, lowercase:
-    /// the transmitted pixel data stays in the terminal's image registry).
-    /// Call when leaving any view that was showing an image so it doesn't
-    /// bleed into the next view's cells. Keeps `kitty_images` intact —
-    /// ids and `transmitted` flags stay valid against the retained
-    /// terminal-side data, so re-entering the view is a single cheap
-    /// placement escape, with no PNG re-encode or re-transmit. Terminal
-    /// data is freed only when a URL ages out of our LRU (`d=I` via
-    /// `pending_deletes`), keeping the terminal's copy bounded by
-    /// `MAX_CACHED_IMAGES`.
+    /// **Transitional shim.** Tell the terminal to drop every Kitty
+    /// *placement* (`d=a`, lowercase: the transmitted pixel data stays in
+    /// the terminal's image registry). Call when leaving any view that was
+    /// showing an image so it doesn't bleed into the next view's cells.
+    /// Keeps cached entries and their `transmitted` flags intact, so
+    /// re-entering the view is a single cheap placement escape, with no
+    /// PNG re-transmit. Terminal data is freed only when a URL ages out of
+    /// our LRU (`d=I` via `pending_deletes`), keeping the terminal's copy
+    /// bounded by `MAX_CACHED_IMAGES`.
     pub fn clear_terminal(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         if self.protocol != ImageProtocol::Kitty {
             return Ok(());
@@ -460,6 +522,58 @@ impl ImageCache {
             write!(stdout, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id)?;
         }
         Ok(())
+    }
+}
+
+/// Test-only entry states for injecting cache state without a network
+/// fetch.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestState {
+    InFlight,
+    Failed,
+}
+
+/// Test-only constructors so this module's tests (and other modules'
+/// tests) can populate the cache without a fetch.
+#[cfg(test)]
+impl ImageCache {
+    /// Insert a ready entry. When `transmitted` is false the entry carries
+    /// a small valid PNG so the transmit path is exercisable; a
+    /// transmitted entry has already dropped its payload.
+    pub(crate) fn insert_ready_for_test(
+        &mut self,
+        url: &str,
+        id: u32,
+        w: u32,
+        h: u32,
+        transmitted: bool,
+    ) {
+        let png = (!transmitted).then(|| {
+            Arc::new(
+                encode_png(&DynamicImage::new_rgb8(1, 1)).expect("test fixture PNG must encode"),
+            )
+        });
+        self.insert_entry(
+            url.to_string(),
+            Entry::Ready {
+                image: ReadyImage {
+                    id,
+                    width: w,
+                    height: h,
+                    transmitted,
+                },
+                png,
+            },
+        );
+    }
+
+    pub(crate) fn insert_state_for_test(&mut self, url: &str, state: TestState) {
+        let entry = match state {
+            TestState::InFlight => Entry::InFlight,
+            TestState::Failed => Entry::Failed,
+        };
+        self.insert_entry(url.to_string(), entry);
     }
 }
 
@@ -492,6 +606,15 @@ fn fetch_and_decode(url: &str, client: &reqwest::blocking::Client) -> Option<Dyn
     reader.limits(limits);
     let img = reader.decode().ok()?;
     Some(downscale(img, MAX_SOURCE_DIM))
+}
+
+/// Worker entry point: fetch + decode + downscale, then encode PNG so the
+/// decoded pixels never reach the main thread.
+fn fetch_encode_and_decode(url: &str, client: &reqwest::blocking::Client) -> Option<EncodedImage> {
+    let img = fetch_and_decode(url, client)?;
+    let (width, height) = img.dimensions();
+    let png = encode_png(&img)?;
+    Some(EncodedImage { png, width, height })
 }
 
 fn downscale(img: DynamicImage, max_dim: u32) -> DynamicImage {
@@ -614,6 +737,153 @@ mod tests {
         assert!(r >= 1);
     }
 
+    // ── entry model (PNG-only cache) ─────────────────────────────────────
+
+    #[test]
+    fn view_reports_missing_loading_ready_failed() {
+        let mut cache = ImageCache::new();
+        assert!(matches!(
+            cache.view("https://x/absent.png"),
+            ImageView::Missing
+        ));
+
+        cache.insert_state_for_test("https://x/loading.png", TestState::InFlight);
+        assert!(matches!(
+            cache.view("https://x/loading.png"),
+            ImageView::Loading
+        ));
+
+        cache.insert_ready_for_test("https://x/ready.png", 7, 640, 480, false);
+        match cache.view("https://x/ready.png") {
+            ImageView::Ready(img) => {
+                assert_eq!(img.id, 7);
+                assert_eq!(img.width, 640);
+                assert_eq!(img.height, 480);
+                assert!(!img.transmitted);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+
+        cache.insert_state_for_test("https://x/failed.png", TestState::Failed);
+        assert!(matches!(
+            cache.view("https://x/failed.png"),
+            ImageView::Failed
+        ));
+    }
+
+    #[test]
+    fn poll_completed_stores_encoded_png_and_dimensions() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        let png = encode_png(&DynamicImage::new_rgb8(4, 4)).unwrap();
+        let url = "https://x/encoded.png".to_string();
+        cache.in_flight.insert(url.clone());
+        cache
+            .sender
+            .send((
+                url.clone(),
+                Some(EncodedImage {
+                    png: png.clone(),
+                    width: 4,
+                    height: 4,
+                }),
+            ))
+            .unwrap();
+
+        assert!(cache.poll_completed());
+        match cache.view(&url) {
+            ImageView::Ready(img) => {
+                assert_eq!((img.width, img.height), (4, 4));
+                assert!(!img.transmitted);
+                // 24-bit range, 0 reserved by the Kitty spec.
+                assert!(img.id > 0 && img.id <= 0x00FF_FFFF);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        match cache.entries.get(&url) {
+            Some(Entry::Ready {
+                png: Some(stored), ..
+            }) => assert_eq!(&**stored, &png),
+            _ => panic!("expected the encoded PNG to be stored in the entry"),
+        }
+        assert!(!cache.in_flight.contains(&url));
+    }
+
+    #[test]
+    fn ensure_fetches_is_idempotent_for_known_urls() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        let url = "https://example.com/known-failed.png".to_string();
+        // Pre-record the failure so the test exercises the failed-state
+        // path: the entry makes `ensure_fetches` a no-op. (The harness
+        // points HTTP(S)_PROXY at a dead port, so even a regression that
+        // re-queued this URL would fail fast without touching the network.)
+        cache.insert_state_for_test(&url, TestState::Failed);
+
+        cache.ensure_fetches(std::slice::from_ref(&url));
+        cache.ensure_fetches(std::slice::from_ref(&url));
+
+        assert!(matches!(cache.view(&url), ImageView::Failed));
+        assert_eq!(cache.entries.len(), 1, "must not queue a second entry");
+        assert_eq!(cache.order.len(), 1, "must not re-record insertion order");
+        assert!(
+            !cache.in_flight.contains(&url),
+            "must not re-queue the fetch"
+        );
+    }
+
+    #[test]
+    fn lru_never_evicts_pinned_urls() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        let pinned = "https://x/pinned.png".to_string();
+        cache.insert_ready_for_test(&pinned, 1, 8, 8, false);
+        cache.set_pinned(HashSet::from([pinned.clone()]));
+
+        for i in 0..MAX_CACHED_IMAGES + 4 {
+            cache.insert_ready_for_test(
+                &format!("https://x/fill-{i}.png"),
+                100 + i as u32,
+                8,
+                8,
+                false,
+            );
+        }
+
+        assert!(
+            matches!(cache.view(&pinned), ImageView::Ready(_)),
+            "the pinned URL must survive eviction"
+        );
+        assert!(cache.entries.len() <= MAX_CACHED_IMAGES);
+        assert!(
+            !cache.entries.contains_key("https://x/fill-0.png"),
+            "unpinned entries still age out"
+        );
+    }
+
+    #[test]
+    fn lru_eviction_of_transmitted_image_queues_terminal_delete() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        cache.insert_ready_for_test("https://x/dropped.png", 4242, 8, 8, true);
+
+        for i in 0..MAX_CACHED_IMAGES {
+            cache.insert_ready_for_test(
+                &format!("https://x/keep-{i}.png"),
+                500 + i as u32,
+                8,
+                8,
+                false,
+            );
+        }
+
+        assert!(matches!(
+            cache.view("https://x/dropped.png"),
+            ImageView::Missing
+        ));
+        assert_eq!(cache.pending_deletes, vec![4242]);
+    }
+
     // ── ImageCache ───────────────────────────────────────────────────────
 
     #[test]
@@ -629,8 +899,8 @@ mod tests {
     fn cache_tracks_known_failures() {
         let mut cache = ImageCache::new();
         // Mark as known-failed.
-        cache.insert_image("http://example.com/x.png".into(), None);
-        assert!(cache.images.contains_key("http://example.com/x.png"));
+        cache.insert_state_for_test("http://example.com/x.png", TestState::Failed);
+        assert!(cache.entries.contains_key("http://example.com/x.png"));
         assert!(!cache.has_image("http://example.com/x.png"));
     }
 
@@ -641,7 +911,7 @@ mod tests {
         assert!(cache.start_fetch("https://example.com/img.png"));
         // No fetch should have spawned.
         assert!(!cache.in_flight.contains("https://example.com/img.png"));
-        assert!(!cache.images.contains_key("https://example.com/img.png"));
+        assert!(!cache.entries.contains_key("https://example.com/img.png"));
     }
 
     #[test]
@@ -651,52 +921,60 @@ mod tests {
         // localhost / private IPs are blocked by is_safe_auto_url.
         assert!(cache.start_fetch("http://127.0.0.1/x.png"));
         // Recorded as a known failure so it isn't re-queued every tick.
-        assert!(cache.images.contains_key("http://127.0.0.1/x.png"));
+        assert!(cache.entries.contains_key("http://127.0.0.1/x.png"));
+        assert!(matches!(
+            cache.view("http://127.0.0.1/x.png"),
+            ImageView::Failed
+        ));
         assert!(!cache.has_image("http://127.0.0.1/x.png"));
         assert!(!cache.in_flight.contains("http://127.0.0.1/x.png"));
     }
 
     #[test]
-    fn insert_image_evicts_oldest_past_cap() {
+    fn lru_evicts_oldest_past_cap() {
         let mut cache = ImageCache::new();
-        cache.protocol = ImageProtocol::Kitty;
-        let img = DynamicImage::new_rgb8(2, 2);
+        cache.force_protocol(ImageProtocol::Kitty);
         for i in 0..MAX_CACHED_IMAGES + 3 {
-            cache.insert_image(format!("https://x/{i}.png"), Some(Arc::new(img.clone())));
+            cache.insert_ready_for_test(&format!("https://x/{i}.png"), i as u32 + 1, 8, 8, false);
         }
-        assert_eq!(cache.images.len(), MAX_CACHED_IMAGES);
-        assert_eq!(cache.images_order.len(), MAX_CACHED_IMAGES);
+        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES);
+        assert_eq!(cache.order.len(), MAX_CACHED_IMAGES);
         // The three oldest are gone, the newest survive.
-        assert!(!cache.images.contains_key("https://x/0.png"));
-        assert!(!cache.images.contains_key("https://x/2.png"));
+        assert!(matches!(cache.view("https://x/0.png"), ImageView::Missing));
+        assert!(matches!(cache.view("https://x/2.png"), ImageView::Missing));
         assert!(cache.has_image(&format!("https://x/{}.png", MAX_CACHED_IMAGES + 2)));
-        // Eviction also drops the Kitty payload for the evicted URL.
-        cache.kitty_images.insert("https://x/3.png".into(), None);
-        cache.insert_image("https://x/new.png".into(), Some(Arc::new(img)));
-        assert!(!cache.kitty_images.contains_key("https://x/3.png"));
     }
 
     #[test]
-    fn insert_image_overwrite_does_not_grow_order() {
+    fn overwrite_does_not_grow_order() {
         let mut cache = ImageCache::new();
-        let img = DynamicImage::new_rgb8(2, 2);
-        cache.insert_image("https://x/a.png".into(), None);
-        cache.insert_image("https://x/a.png".into(), Some(Arc::new(img)));
-        assert_eq!(cache.images_order.len(), 1);
+        cache.insert_state_for_test("https://x/a.png", TestState::Failed);
+        cache.insert_ready_for_test("https://x/a.png", 9, 8, 8, false);
+        assert_eq!(cache.order.len(), 1);
         assert!(cache.has_image("https://x/a.png"));
     }
 
     #[test]
-    fn ensure_kitty_ready_assigns_unique_ids() {
+    fn poll_completed_assigns_unique_ids() {
         let mut cache = ImageCache::new();
-        cache.protocol = ImageProtocol::Kitty;
-        let img = DynamicImage::new_rgb8(8, 8);
-        cache.images.insert("a".into(), Some(Arc::new(img.clone())));
-        cache.images.insert("b".into(), Some(Arc::new(img)));
-        assert!(cache.ensure_kitty_ready("a"));
-        assert!(cache.ensure_kitty_ready("b"));
-        let id_a = cache.kitty_images.get("a").unwrap().as_ref().unwrap().id;
-        let id_b = cache.kitty_images.get("b").unwrap().as_ref().unwrap().id;
+        cache.force_protocol(ImageProtocol::Kitty);
+        let png = encode_png(&DynamicImage::new_rgb8(8, 8)).unwrap();
+        for url in ["a", "b"] {
+            cache.in_flight.insert(url.to_string());
+            cache
+                .sender
+                .send((
+                    url.to_string(),
+                    Some(EncodedImage {
+                        png: png.clone(),
+                        width: 8,
+                        height: 8,
+                    }),
+                ))
+                .unwrap();
+            assert!(cache.poll_completed());
+        }
+        let (id_a, id_b) = (ready_id(&cache, "a"), ready_id(&cache, "b"));
         assert_ne!(id_a, id_b);
         assert!(id_a > 0 && id_b > 0);
     }
@@ -732,17 +1010,24 @@ mod tests {
         assert_eq!(s, "\x1b_Ga=p,i=7,p=1,q=2,c=30,r=12;\x1b\\");
     }
 
-    // ── placement / terminal-data lifecycle ─────────────────────────────
+    // ── placement / terminal-data lifecycle (transitional shim) ─────────
 
-    /// Build a Kitty-mode cache with a decoded image already in place.
+    /// Build a Kitty-mode cache with ready images already in place.
     fn cache_with_images(urls: &[&str]) -> ImageCache {
         let mut cache = ImageCache::new();
-        cache.protocol = ImageProtocol::Kitty;
-        let img = DynamicImage::new_rgb8(8, 8);
-        for url in urls {
-            cache.insert_image(url.to_string(), Some(Arc::new(img.clone())));
+        cache.force_protocol(ImageProtocol::Kitty);
+        for (i, url) in urls.iter().enumerate() {
+            cache.insert_ready_for_test(url, i as u32 + 1, 8, 8, false);
         }
         cache
+    }
+
+    /// Id of the ready entry for `url`.
+    fn ready_id(cache: &ImageCache, url: &str) -> u32 {
+        match cache.view(url) {
+            ImageView::Ready(img) => img.id,
+            other => panic!("expected Ready for {url}, got {other:?}"),
+        }
     }
 
     #[test]
@@ -797,13 +1082,7 @@ mod tests {
         cache
             .render_at(&mut out, "https://x/a.png", 0, 0, 40, 10)
             .unwrap();
-        let id_a = cache
-            .kitty_images
-            .get("https://x/a.png")
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .id;
+        let id_a = ready_id(&cache, "https://x/a.png");
 
         let mut out_b: Vec<u8> = Vec::new();
         cache
@@ -833,23 +1112,22 @@ mod tests {
         cache
             .render_at(&mut out, "https://x/old.png", 0, 0, 40, 10)
             .unwrap();
-        let old_id = cache
-            .kitty_images
-            .get("https://x/old.png")
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .id;
+        let old_id = ready_id(&cache, "https://x/old.png");
 
         // Push the transmitted image out of the LRU.
-        let img = DynamicImage::new_rgb8(2, 2);
         for i in 0..MAX_CACHED_IMAGES {
-            cache.insert_image(
-                format!("https://x/fill-{i}.png"),
-                Some(Arc::new(img.clone())),
+            cache.insert_ready_for_test(
+                &format!("https://x/fill-{i}.png"),
+                100 + i as u32,
+                8,
+                8,
+                false,
             );
         }
-        assert!(!cache.kitty_images.contains_key("https://x/old.png"));
+        assert!(matches!(
+            cache.view("https://x/old.png"),
+            ImageView::Missing
+        ));
         assert_eq!(cache.pending_deletes, vec![old_id]);
 
         // The next write flushes a d=I (placements + pixel data) for it.

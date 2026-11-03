@@ -958,10 +958,10 @@ mod tests {
         // placement.
         app.image_cache
             .force_protocol(crate::image::ImageProtocol::Kitty);
-        app.image_cache.insert_image(
-            "https://ex.com/t.png".to_string(),
-            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
-        );
+        // Test-only ready entry: the thumbnail is already encoded, so the
+        // detail renderer reserves the strip and queues a placement.
+        app.image_cache
+            .insert_ready_for_test("https://ex.com/t.png", 1, 100, 100, false);
 
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1004,10 +1004,10 @@ mod tests {
         app.selected_item = Some(0);
         app.image_cache
             .force_protocol(crate::image::ImageProtocol::Kitty);
-        app.image_cache.insert_image(
-            "https://ex.com/t.png".to_string(),
-            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
-        );
+        // Test-only ready entry: the thumbnail is already encoded, so the
+        // detail renderer reserves the strip and queues a placement.
+        app.image_cache
+            .insert_ready_for_test("https://ex.com/t.png", 1, 100, 100, false);
 
         // Short terminal: detail area falls below the strip threshold.
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
