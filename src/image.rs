@@ -92,7 +92,7 @@ fn protocol_for(
 ) -> ImageProtocol {
     // tmux inherits KITTY_WINDOW_ID / TERM_PROGRAM from the outer terminal
     // but swallows raw APC sequences (no passthrough support here yet), so
-    // the image would never appear while the strip still gets reserved.
+    // the image would never appear.
     if tmux {
         return ImageProtocol::None;
     }
@@ -301,6 +301,13 @@ impl ImageCache {
         self.evict_lru();
     }
 
+    /// Drop the current article's pin set and let the LRU reclaim its
+    /// images. Called when the user leaves the detail view.
+    pub fn clear_pinned(&mut self) {
+        self.pinned.clear();
+        self.evict_lru();
+    }
+
     /// Queue a background fetch+encode for `url`. Returns false if the
     /// fetch could not be started right now (concurrency cap full, or OS
     /// thread creation failed) — both are transient, and the caller can
@@ -406,10 +413,13 @@ impl ImageCache {
     }
 
     /// Record an entry, then trim the LRU. Overwriting an existing entry
-    /// (e.g. `InFlight` → `Ready`) keeps its original recency slot.
+    /// (e.g. `InFlight` → `Ready`) keeps its original recency slot; a
+    /// replaced entry that had already been transmitted queues a terminal
+    /// `d=I` so its pixel data is not leaked.
     fn insert_entry(&mut self, url: String, entry: Entry) {
-        if self.entries.insert(url.clone(), entry).is_none() {
-            self.order.push_back(url);
+        match self.entries.insert(url.clone(), entry) {
+            Some(old) => self.drop_entry(old),
+            None => self.order.push_back(url),
         }
         self.evict_lru();
     }
@@ -440,26 +450,28 @@ impl ImageCache {
         }
     }
 
-    /// Drive the terminal's image state for one frame: pin `specs`, evict,
-    /// transmit at most one not-yet-sent image, and re-place any transmitted
-    /// image whose cell size changed.
+    /// Drive the terminal's image state for one frame: flush queued deletes,
+    /// transmit at most one not-yet-sent image, and (re)place every
+    /// transmitted image whose cell size is unknown or changed.
     ///
-    /// `specs` are the images visible this frame, in the order the detail
-    /// view wants them sent. Write errors propagate (a half-written escape
-    /// leaves the terminal in an unknown state) but are swallowed by the
-    /// TUI, which treats a failed frame as a failed frame. No-op on
-    /// terminals without image support.
+    /// The detail renderer pins the whole current article through
+    /// [`ImageCache::set_pinned`] before calling this, so the LRU cannot
+    /// reclaim an image the user can still scroll back to. `specs` are the
+    /// images visible this frame, in the order the detail view wants them
+    /// sent. Write errors propagate (a half-written escape leaves the
+    /// terminal in an unknown state); the TUI propagates them as a failed
+    /// frame. No-op on terminals without image support.
     pub fn pump(&mut self, stdout: &mut impl Write, specs: &[PlacementSpec]) -> io::Result<()> {
         if self.protocol != ImageProtocol::UnicodePlaceholders {
             return Ok(());
         }
 
-        // 1. Everything on screen is pinned for this frame, so the LRU can
-        //    only reclaim URLs the user has scrolled away from. Eviction has
-        //    no writer, so queued deletes (`d=I`: placements + pixel data)
-        //    are flushed here — and, with them, the stale placement sizes of
-        //    those ids, so a later re-fetch can't be suppressed by them.
-        self.set_pinned(specs.iter().map(|s| s.url.clone()).collect());
+        // 1. The current article is already pinned by the detail renderer,
+        //    so the LRU can only reclaim URLs from a previous article.
+        //    Eviction has no writer, so queued deletes (`d=I`: placements +
+        //    pixel data) are flushed here — and, with them, the stale
+        //    placement sizes of those ids, so a later re-fetch can't be
+        //    suppressed by them.
         self.flush_pending_deletes(stdout)?;
 
         // 2. Re-place images that are already in the terminal's registry but
@@ -547,9 +559,11 @@ impl ImageCache {
                 self.last_placement.insert(id, (cols, rows));
                 Ok(())
             }
-            // Nothing recorded: no re-place is owed yet. Record the size so
-            // a later change is detected without a redundant escape.
+            // Nothing recorded yet, but the caller only syncs ids the
+            // terminal already holds, so emit the placement now instead of
+            // silently recording a size the terminal was never told.
             None => {
+                place_virtual_image(stdout, id, cols, rows)?;
                 self.last_placement.insert(id, (cols, rows));
                 Ok(())
             }
@@ -878,7 +892,8 @@ mod tests {
     fn protocol_detection_supports_kitty_and_ghostty_only() {
         use ImageProtocol::*;
         // `ImageProtocol::None` is glob-imported above, so spell the
-        // `Option` variant explicitly for the leading capability args.
+        // `Option` variant explicitly for the trailing optional `TERM` /
+        // `TERM_PROGRAM` args.
         assert_eq!(
             protocol_for(false, true, Option::None, Option::None),
             UnicodePlaceholders
@@ -986,6 +1001,21 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_transmitted_entry_queues_terminal_delete() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
+        cache.insert_ready_for_test("https://x/a.png", 7, 8, 8, true);
+        assert!(cache.pending_deletes.is_empty());
+
+        // Replacing a transmitted entry leaves its terminal-side pixel data
+        // orphaned unless the old id is queued for `d=I`.
+        cache.insert_ready_for_test("https://x/a.png", 8, 8, 8, true);
+        assert_eq!(cache.pending_deletes, vec![7]);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(ready_id(&cache, "https://x/a.png"), 8);
+    }
+
+    #[test]
     fn poll_completed_assigns_unique_ids() {
         let mut cache = ImageCache::new();
         cache.force_protocol(ImageProtocol::UnicodePlaceholders);
@@ -1020,16 +1050,17 @@ mod tests {
 
     #[test]
     fn transmit_kitty_base64_chunks_correctly() {
-        // Build a PNG large enough to require chunking.
-        let img = DynamicImage::new_rgb8(128, 128);
-        let png = encode_png(&img).unwrap();
+        // Two full 4096-byte chunks plus one byte guarantees three chunks,
+        // so the continuation flag (`m=1`) is exercised, not just the tail.
+        let payload = "A".repeat(4096 * 2 + 1);
         let mut out: Vec<u8> = Vec::new();
-        transmit_kitty_base64(&mut out, &BASE64.encode(&png), 42).unwrap();
+        transmit_kitty_base64(&mut out, &payload, 42).unwrap();
         let s = String::from_utf8_lossy(&out);
         // First chunk has the full control payload.
-        assert!(s.contains("a=t,f=100,t=d,i=42,q=2"));
-        // Last chunk must end with the terminator after m=0.
-        assert!(s.contains("m=0;"));
+        assert!(s.contains("a=t,f=100,t=d,i=42,q=2,m=1;"), "{s}");
+        assert_eq!(s.matches("m=1").count(), 2, "{s}");
+        // Only the final chunk marks the end of the payload.
+        assert_eq!(s.matches("m=0").count(), 1, "{s}");
         assert!(s.ends_with("\x1b\\"));
     }
 
@@ -1080,9 +1111,19 @@ mod tests {
         let mut cache = ImageCache::new();
         cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         cache.insert_ready_for_test("a", 1, 40, 10, true);
-        let mut out = Vec::new();
-        cache.pump(&mut out, &[spec("a", 40, 10)]).unwrap();
-        assert!(out.is_empty());
+
+        // First frame has no recorded placement, so it must emit one rather
+        // than silently assuming the terminal already knows the cells.
+        let mut first = Vec::new();
+        cache.pump(&mut first, &[spec("a", 40, 10)]).unwrap();
+        let s = String::from_utf8_lossy(&first);
+        assert!(s.contains("a=p,U=1,i=1,p=1,c=40,r=10"), "{s}");
+        assert!(!s.contains("a=t"), "{s}");
+
+        // Same cells: the terminal already has this placement.
+        let mut same = Vec::new();
+        cache.pump(&mut same, &[spec("a", 40, 10)]).unwrap();
+        assert!(same.is_empty(), "{:?}", String::from_utf8_lossy(&same));
 
         let mut resized = Vec::new();
         cache.pump(&mut resized, &[spec("a", 60, 15)]).unwrap();
@@ -1136,23 +1177,23 @@ mod tests {
     }
 
     #[test]
-    fn pump_pins_spec_urls_against_eviction() {
+    fn whole_article_pins_survive_eviction_until_cleared() {
         let mut cache = ImageCache::new();
         cache.force_protocol(ImageProtocol::UnicodePlaceholders);
-        let urls: Vec<String> = (0..MAX_CACHED_IMAGES)
+        // One more URL than the LRU cap: a long article can pin past it.
+        let urls: Vec<String> = (0..=MAX_CACHED_IMAGES)
             .map(|i| format!("https://x/pinned-{i}.png"))
             .collect();
-        for (i, url) in urls.iter().enumerate() {
+        for (i, url) in urls.iter().take(MAX_CACHED_IMAGES).enumerate() {
             cache.insert_ready_for_test(url, i as u32 + 1, 8, 8, false);
         }
-        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES);
+        // The detail renderer pins the whole article, including the image
+        // that has not been inserted yet.
+        cache.set_pinned(urls.iter().cloned().collect());
+        cache.insert_ready_for_test(&urls[MAX_CACHED_IMAGES], 500, 8, 8, false);
+        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES + 1);
 
-        let specs: Vec<PlacementSpec> = urls.iter().map(|u| spec(u, 8, 4)).collect();
-        let mut out = Vec::new();
-        cache.pump(&mut out, &specs).unwrap();
-
-        // A 33rd insertion cannot evict anything: every existing URL is
-        // pinned by the specs, so the newcomer is the only evictable entry.
+        // A 33rd *unpinned* insertion cannot evict any article image.
         cache.insert_ready_for_test("https://x/newcomer.png", 999, 8, 8, false);
         for url in &urls {
             assert!(
@@ -1163,6 +1204,15 @@ mod tests {
         assert!(matches!(
             cache.view("https://x/newcomer.png"),
             ImageView::Missing
+        ));
+
+        // Leaving the article drops the pins and lets the LRU shrink.
+        cache.clear_pinned();
+        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES);
+        assert!(matches!(cache.view(&urls[0]), ImageView::Missing));
+        assert!(matches!(
+            cache.view(&urls[MAX_CACHED_IMAGES]),
+            ImageView::Ready(_)
         ));
     }
 

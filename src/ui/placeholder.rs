@@ -19,6 +19,11 @@ pub(crate) const DEFAULT_IMAGE_ROWS: u16 = 12;
 /// Upper bound on the rows a single image may occupy.
 pub(crate) const MAX_IMAGE_ROWS: u16 = 60;
 
+/// Upper bound on the columns a placeholder image may occupy. The terminal
+/// addresses a placeholder column with one diacritic byte (`min(255)` in the
+/// table lookup), so wider images would alias and smear.
+pub(crate) const MAX_PLACEHOLDER_COLS: u16 = 256;
+
 /// Height of a terminal cell relative to its width (terminal cells are tall).
 const CELL_ASPECT: f32 = 0.5;
 
@@ -29,6 +34,7 @@ pub(crate) fn display_rows(dims: Option<(u32, u32)>, cols: u16) -> u16 {
     let Some((width, height)) = dims else {
         return DEFAULT_IMAGE_ROWS;
     };
+    let cols = cols.min(MAX_PLACEHOLDER_COLS);
     if width == 0 || cols == 0 {
         return DEFAULT_IMAGE_ROWS;
     }
@@ -38,6 +44,7 @@ pub(crate) fn display_rows(dims: Option<(u32, u32)>, cols: u16) -> u16 {
 
 /// Placeholder cells for an image covering `cols` x `rows` cells.
 pub(crate) fn placeholder_lines(id: u32, cols: u16, rows: u16) -> Vec<Line<'static>> {
+    let cols = cols.min(MAX_PLACEHOLDER_COLS);
     let fg = Style::default().fg(Color::Rgb(
         ((id >> 16) & 0xff) as u8,
         ((id >> 8) & 0xff) as u8,
@@ -64,6 +71,7 @@ pub(crate) fn loading_lines(
     rows: u16,
     colors: &ColorScheme,
 ) -> Vec<Line<'static>> {
+    let cols = cols.min(MAX_PLACEHOLDER_COLS);
     let style = Style::default().fg(colors.muted);
     let caption = truncate_to_cols(&format!("[loading image: {alt}]"), cols);
 
@@ -130,6 +138,20 @@ mod tests {
         assert_eq!(display_rows(Some((1600, 900)), 80), 23);
         assert_eq!(display_rows(None, 80), DEFAULT_IMAGE_ROWS);
         assert_eq!(display_rows(Some((100, 5000)), 80), MAX_IMAGE_ROWS);
+    }
+
+    #[test]
+    fn placeholder_columns_are_clamped_to_the_diacritic_table() {
+        let lines = placeholder_lines(1, 300, 1);
+        assert_eq!(lines.len(), 1);
+        let cells = lines[0].spans[0].content.matches('\u{10EEEE}').count();
+        assert_eq!(cells, usize::from(MAX_PLACEHOLDER_COLS));
+
+        // The row estimate must use the same clamped width, not 300.
+        assert_eq!(
+            display_rows(Some((1600, 400)), 300),
+            display_rows(Some((1600, 400)), MAX_PLACEHOLDER_COLS)
+        );
     }
 
     #[test]

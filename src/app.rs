@@ -1625,6 +1625,9 @@ impl App {
         self.detail_vertical_scroll = 0;
         self.clear_article_search();
         self.input_mode = InputMode::Normal;
+        // The article's images are no longer reachable, so the image cache
+        // may reclaim them instead of pinning them for the whole session.
+        self.image_cache.clear_pinned();
         self.view = new_view;
     }
 
@@ -1688,8 +1691,9 @@ impl App {
     /// Identity of the detail body layout for the focused article.
     ///
     /// Returns a key with empty strings when no article is focused. The
-    /// detail view never renders in that state, so the placeholder key is
-    /// never cached.
+    /// detail view does not normally render in that state; an out-of-range
+    /// selection can still compute the placeholder key, but it caches no
+    /// body of its own.
     pub fn body_key(&self, width: u16, fulltext: bool) -> BodyKey {
         let (feed_url, item_key) = self
             .current_article_indices()

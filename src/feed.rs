@@ -1175,8 +1175,9 @@ pub(crate) fn render_clean_html(html: &str, width: usize) -> String {
 }
 
 /// Sentinel code points wrapping a block image's ordinal in the prepared
-/// body HTML. Unicode private-use range, so no feed text can collide with
-/// them, and `html2text` passes them through untouched.
+/// body HTML. Unicode private-use range, so ordinary feed text is unlikely
+/// to collide with them; a collision would only duplicate an image block,
+/// and `html2text` passes them through untouched.
 pub const IMG_SENTINEL_START: char = '\u{E000}';
 pub const IMG_SENTINEL_END: char = '\u{E001}';
 
@@ -1187,6 +1188,11 @@ const MAX_BODY_IMAGES: usize = 40;
 /// Elements that count as "block-ish" for image classification: an image
 /// whose nearest such ancestor holds no other text is on its own line.
 const BLOCK_ANCESTORS: &[&str] = &["p", "figure", "div", "li", "td", "th", "blockquote"];
+
+/// Elements whose content the HTML parser treats as raw text. An `<img`
+/// inside one is text, not an element, so the raw walk must skip it without
+/// consuming an ordinal.
+const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style", "noscript", "textarea", "title"];
 
 /// A block-level image discovered in the (already flattened) description
 /// HTML, in document order. `url` is fully resolved; `declared_w` /
@@ -1206,6 +1212,10 @@ pub struct BodyImage {
 pub struct PreparedBody {
     pub html: String,
     pub images: Vec<BodyImage>,
+    /// Cached output of [`PreparedBody::render_text`]. `OnceLock` lets the
+    /// accessor take `&self` and still initialize at most once, so the
+    /// expensive HTML→text pass does not run on every frame.
+    rendered_text: std::sync::OnceLock<String>,
 }
 
 impl PreparedBody {
@@ -1215,8 +1225,13 @@ impl PreparedBody {
     /// heading and `<br>` breaks but never hard-wraps a paragraph; the real
     /// content width is applied later by the body layout. Sentinels are
     /// ordinary PUA characters, so they survive this pass untouched.
-    pub(crate) fn render_text(&self) -> String {
-        html2text::from_read_with_decorator(self.html.as_bytes(), 10_000, CleanDecorator::new())
+    ///
+    /// The result is cached on first use; callers that need an owned copy
+    /// can clone the returned slice.
+    pub(crate) fn render_text(&self) -> &str {
+        self.rendered_text.get_or_init(|| {
+            html2text::from_read_with_decorator(self.html.as_bytes(), 10_000, CleanDecorator::new())
+        })
     }
 }
 
@@ -1241,6 +1256,7 @@ pub(crate) fn prepare_body_html(flattened: &str, base_url: Option<&str>) -> Prep
             return PreparedBody {
                 html: flattened.to_string(),
                 images: Vec::new(),
+                rendered_text: std::sync::OnceLock::new(),
             }
         }
     };
@@ -1279,7 +1295,13 @@ pub(crate) fn prepare_body_html(flattened: &str, base_url: Option<&str>) -> Prep
             continue;
         }
 
-        if !is_img_tag_open(&flattened[lt..]) {
+        // Only `<`, `</`, and `<!` start a tag. A bare `<` in text is copied
+        // as text and the scan resumes after it.
+        let starts_tag = flattened[lt + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        if !starts_tag {
             html.push('<');
             pos = lt + 1;
             continue;
@@ -1291,6 +1313,29 @@ pub(crate) fn prepare_body_html(flattened: &str, base_url: Option<&str>) -> Prep
             break;
         };
         let tag = &flattened[lt..=gt];
+
+        if !is_img_tag_open(tag) {
+            html.push_str(tag);
+            pos = gt + 1;
+
+            // The HTML parser treats raw-text element content as text, so an
+            // `<img` inside it is not an element and must not consume an
+            // ordinal. Copy the whole element body without scanning it.
+            if let Some(name) = opening_raw_text_element(tag) {
+                let Some(close_lt) = find_raw_text_close(flattened, &name, pos) else {
+                    html.push_str(&flattened[pos..]);
+                    break;
+                };
+                let Some(close_gt) = find_tag_end(flattened, close_lt + 2) else {
+                    html.push_str(&flattened[pos..]);
+                    break;
+                };
+                html.push_str(&flattened[pos..=close_gt]);
+                pos = close_gt + 1;
+            }
+            continue;
+        }
+
         let attrs = parse_tag_attrs(tag);
         let is_block = block_flags.get(ordinal).copied().unwrap_or(false);
         ordinal += 1;
@@ -1309,7 +1354,11 @@ pub(crate) fn prepare_body_html(flattened: &str, base_url: Option<&str>) -> Prep
         pos = gt + 1;
     }
 
-    PreparedBody { html, images }
+    PreparedBody {
+        html,
+        images,
+        rendered_text: std::sync::OnceLock::new(),
+    }
 }
 
 /// True when `s` (which starts at a `<`) opens an `<img>` tag.
@@ -1351,6 +1400,66 @@ fn find_tag_end(s: &str, from: usize) -> Option<usize> {
             }
         }
         i += 1;
+    }
+    None
+}
+
+/// Lowercase ASCII tag name at the start of `tag` (leading `<` / `</`
+/// skipped). Returns `None` for markup without a name (`<!…`, `<?…`).
+fn tag_name_lower(tag: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    if bytes.get(i) == Some(&b'/') {
+        i += 1;
+    }
+    let start = i;
+    while bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic()) {
+        i += 1;
+    }
+    if i == start {
+        None
+    } else {
+        Some(tag[start..i].to_ascii_lowercase())
+    }
+}
+
+/// Name of an opening raw-text element ([`RAW_TEXT_ELEMENTS`]) whose content
+/// the parser treats as text. Closing tags and self-closing forms return
+/// `None` because they have no content of their own.
+fn opening_raw_text_element(tag: &str) -> Option<String> {
+    if tag.as_bytes().get(1) == Some(&b'/') {
+        return None;
+    }
+    let name = tag_name_lower(tag)?;
+    if !RAW_TEXT_ELEMENTS.contains(&name.as_str()) {
+        return None;
+    }
+    let self_closing = tag.trim_end_matches('>').trim_end().ends_with('/');
+    (!self_closing).then_some(name)
+}
+
+/// Index of the `<` in the first case-insensitive `</name` end tag at or
+/// after `from`. The byte after the name must end the tag name (whitespace,
+/// `>`, `/`, or end of input), so `</scriptx>` does not close a `<script>`.
+fn find_raw_text_close(s: &str, name: &str, from: usize) -> Option<usize> {
+    let needle = format!("</{name}");
+    let haystack = s.get(from..)?.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(rel) = haystack[search..].find(&needle) {
+        let index = from + search + rel;
+        let after = index + needle.len();
+        match s.as_bytes().get(after) {
+            Some(b) if b.is_ascii_whitespace() || *b == b'>' || *b == b'/' => {
+                return Some(index);
+            }
+            // A longer tag name (`</scriptx>`) is not this element's close.
+            Some(_) => search += rel + 1,
+            // Unterminated `</name` at end of input still ends the content.
+            None => return Some(index),
+        }
     }
     None
 }
@@ -2755,6 +2864,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_body_html_raw_text_imgs_do_not_shift_ordinals() {
+        // `<img` inside `<noscript>` / `<script>` is text to the HTML parser,
+        // so it must not consume a DOM-image ordinal. Before the structural
+        // walk, the raw scan counted both and demoted `after.png` to alt text.
+        let html = r#"<p>Look: <img src=inline.png><noscript><img src=ns.png></noscript></p><figure><img src=fig.png></figure><script>var x="<img src=js.png>"</script><p><img src=after.png></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        let urls: Vec<&str> = prepared.images.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://ex.com/fig.png", "https://ex.com/after.png"]
+        );
+        assert!(prepared.html.contains("<img src=inline.png>"));
+        assert!(prepared
+            .html
+            .contains("<noscript><img src=ns.png></noscript>"));
+        assert!(prepared.html.contains("var x=\"<img src=js.png>\""));
+        assert!(prepared.html.contains("\u{E000}0\u{E001}"));
+        assert!(prepared.html.contains("\u{E000}1\u{E001}"));
+    }
+
+    #[test]
+    fn prepare_body_html_quoted_tag_attribute_is_not_a_tag() {
+        // The `>` inside `title` must not end `<a …>` early, and the quoted
+        // value must be copied as part of its tag rather than scanned for
+        // nested tags.
+        let html = r#"<p><a title="a > b"><img src="x"></a></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://ex.com/x");
+        assert!(prepared.html.contains("\u{E000}0\u{E001}"));
+    }
+
+    #[test]
     fn prepare_body_html_flattened_table_keeps_ordinals() {
         // Reddit-style bodies arrive wrapped in a table. Flattening happens
         // first; discovery and replacement run on that same flattened
@@ -2825,5 +2967,44 @@ mod tests {
         let prepared = item.prepared_body(None);
         assert!(prepared.html.is_empty());
         assert!(prepared.images.is_empty());
+    }
+
+    #[test]
+    fn feed_reload_drops_prepared_body_and_recomputes_on_access() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>x</title>
+    <link>https://ex.com/</link>
+    <description>x</description>
+    <item>
+      <title>Post</title>
+      <link>https://ex.com/post</link>
+      <guid>https://ex.com/post</guid>
+      <description>&lt;figure&gt;&lt;img src="https://ex.com/pics/a.png" alt="A"&gt;&lt;figcaption&gt;Cap&lt;/figcaption&gt;&lt;/figure&gt;</description>
+    </item>
+  </channel>
+</rss>"#;
+        let entry = parse_first_entry(xml);
+        let mut item = FeedItem::from_feed_entry(&entry);
+        assert_eq!(
+            item.prepared_body(Some("https://ex.com/post")).images.len(),
+            1
+        );
+        assert!(item.prepared_body.is_some());
+
+        let feed = Feed {
+            url: "https://ex.com/feed.xml".to_string(),
+            title: "Feed".to_string(),
+            items: vec![item],
+            title_lower: "feed".to_string(),
+        };
+        let json = serde_json::to_string(&feed).unwrap();
+        let mut reloaded: Feed = serde_json::from_str(&json).unwrap();
+        // The lazy cache is not persisted; the first access recomputes it.
+        assert!(reloaded.items[0].prepared_body.is_none());
+        let prepared = reloaded.items[0].prepared_body(Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://ex.com/pics/a.png");
     }
 }

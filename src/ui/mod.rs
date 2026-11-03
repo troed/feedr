@@ -273,6 +273,11 @@ pub fn render<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     // specs left by the previous frame (or by another view) so a stale image
     // is never pumped after the user navigates away.
     app.visible_image_specs.clear();
+    // The detail view pins the whole current article. Any other view has no
+    // article of its own, so drop the pins and let the image LRU shrink.
+    if app.view != View::FeedItemDetail {
+        app.image_cache.clear_pinned();
+    }
 
     // Set background color for the entire terminal
     let bg_block = Block::default().style(Style::default().bg(colors.background));

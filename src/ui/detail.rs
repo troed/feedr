@@ -3,7 +3,9 @@ use crate::body::{body_hash, layout_body, BodyLayout, RowKind};
 use crate::feed::BodyImage;
 use crate::image::{ImageCache, ImageProtocol, ImageView, PlacementSpec};
 use crate::keybindings::{key_display, KeyAction};
-use crate::ui::placeholder::{alt_lines, display_rows, loading_lines, placeholder_lines};
+use crate::ui::placeholder::{
+    alt_lines, display_rows, loading_lines, placeholder_lines, MAX_PLACEHOLDER_COLS,
+};
 use crate::ui::utils::{format_content_for_reading, truncate_url};
 use crate::ui::ColorScheme;
 use ratatui::{
@@ -14,6 +16,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Padding, Paragraph},
     Frame,
 };
+use std::collections::HashSet;
 
 /// Which body the detail view is currently showing. Owns its strings so
 /// the immutable borrow on `app.extracted` is released before we call any
@@ -83,7 +86,7 @@ pub(super) fn render_item_detail<B: Backend>(
                     .and_then(|feed| feed.items.get_mut(item_idx))
                     .map(|item| {
                         let prepared = item.prepared_body(base_url.as_deref());
-                        (prepared.render_text(), prepared.images.clone())
+                        (prepared.render_text().to_string(), prepared.images.clone())
                     })
             } else {
                 None
@@ -137,6 +140,13 @@ pub(super) fn render_item_detail<B: Backend>(
         ),
     };
 
+    // Pin every image the current article references, not just the ones on
+    // screen: scrolling back must not evict and re-transmit an image that
+    // was visible a moment ago. The detail renderer owns this pin set;
+    // `pump` only consumes it. `ui::render` clears it outside this view.
+    let article_urls: HashSet<String> = body_images.iter().map(|image| image.url.clone()).collect();
+    app.image_cache.set_pinned(article_urls);
+
     // Split the area into header, content, and (optionally) a 1-row search
     // footer. The footer is omitted when in-article search is inactive so
     // quiet reading is unchanged.
@@ -167,6 +177,10 @@ pub(super) fn render_item_detail<B: Backend>(
             .saturating_sub(8), // padding for better reading width
     );
     let cols = content_width as u16;
+    // Placeholder cells address columns through one byte of diacritics, so
+    // an image may span at most 256 content columns. Text still wraps at the
+    // full content width; only image rows/specs use the clamped value.
+    let image_cols = cols.min(MAX_PLACEHOLDER_COLS);
     let protocol = app.image_cache.protocol();
 
     // ── Body layout cache ────────────────────────────────────────────────
@@ -186,7 +200,7 @@ pub(super) fn render_item_detail<B: Backend>(
     }
 
     // ── Image block heights ──────────────────────────────────────────────
-    let image_rows = image_display_rows(&body_images, protocol, &app.image_cache, cols);
+    let image_rows = image_display_rows(&body_images, protocol, &app.image_cache, image_cols);
     if image_rows != app.detail_image_rows {
         app.set_detail_image_rows(image_rows);
     }
@@ -317,7 +331,7 @@ pub(super) fn render_item_detail<B: Backend>(
             protocol,
             cache: &app.image_cache,
             colors,
-            cols,
+            cols: image_cols,
         };
         let body_lines = build_body_lines(&cached.layout, &ctx);
 
@@ -370,7 +384,7 @@ pub(super) fn render_item_detail<B: Backend>(
                                 if matches!(app.image_cache.view(&image.url), ImageView::Ready(_)) {
                                     specs.push(PlacementSpec {
                                         url: image.url.clone(),
-                                        cols,
+                                        cols: image_cols,
                                         rows: rows as u16,
                                     });
                                 }
@@ -724,7 +738,7 @@ fn render_search_footer<B: Backend>(f: &mut Frame<B>, app: &App, area: Rect, col
 mod tests {
     use super::*;
     use crate::feed::{Feed, FeedItem};
-    use crate::image::ImageProtocol;
+    use crate::image::{ImageProtocol, ImageView};
     use ratatui::buffer::Buffer;
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
@@ -852,6 +866,22 @@ mod tests {
             text.contains("[A]"),
             "expected alt-text fallback, got buffer: {text:?}"
         );
+    }
+
+    #[test]
+    fn detail_none_protocol_queues_no_fetch_or_placement() {
+        let mut app = app_with_body(
+            r#"<figure><img src="https://ex.com/a.png" alt="A"></figure>"#,
+            ImageProtocol::None,
+        );
+        let _ = draw(&mut app, 80, 40);
+
+        assert!(app.visible_image_specs.is_empty());
+        // No fetch was queued and no cache entry was created.
+        assert!(matches!(
+            app.image_cache.view("https://ex.com/a.png"),
+            ImageView::Missing
+        ));
     }
 
     #[test]
