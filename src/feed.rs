@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use dom_smoothie::{Config as ReadabilityConfig, Readability};
 use feed_rs::parser;
 use html2text::render::text_renderer::{TaggedLine, TextDecorator};
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1150,6 +1150,388 @@ pub(crate) fn render_clean_html(html: &str, width: usize) -> String {
     html2text::from_read_with_decorator(prepped.as_bytes(), width, CleanDecorator::new())
 }
 
+/// Sentinel code points wrapping a block image's ordinal in the prepared
+/// body HTML. Unicode private-use range, so no feed text can collide with
+/// them, and `html2text` passes them through untouched.
+pub const IMG_SENTINEL_START: char = '\u{E000}';
+pub const IMG_SENTINEL_END: char = '\u{E001}';
+
+/// Hard ceiling on inline body images per article. Beyond this the tags are
+/// left in place and render as alt text.
+const MAX_BODY_IMAGES: usize = 40;
+
+/// Elements that count as "block-ish" for image classification: an image
+/// whose nearest such ancestor holds no other text is on its own line.
+const BLOCK_ANCESTORS: &[&str] = &["p", "figure", "div", "li", "td", "th", "blockquote"];
+
+/// A block-level image discovered in the (already flattened) description
+/// HTML, in document order. `url` is fully resolved; `declared_w` /
+/// `declared_h` are the HTML-declared pixel sizes when present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyImage {
+    pub url: String,
+    pub alt: String,
+    pub declared_w: Option<u32>,
+    pub declared_h: Option<u32>,
+}
+
+/// Result of image discovery over a body HTML string: the HTML with every
+/// recorded block image replaced by `IMG_SENTINEL_START <ordinal>
+/// IMG_SENTINEL_END`, plus the recorded images in that same ordinal order.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedBody {
+    pub html: String,
+    pub images: Vec<BodyImage>,
+}
+
+/// Discover block-level `<img>` tags in `flattened` (the output of
+/// [`flatten_description_html`]) and replace each one with a sentinel token
+/// so the image can be rendered in flow after the HTML→text pass.
+///
+/// Classification (inline vs block) comes from a `scraper` DOM parse of the
+/// same string; the raw string is then walked left to right and the n-th
+/// `<img>` tag is replaced when the n-th DOM image was classified as a
+/// block image. Both traversals see one string, so ordinals align.
+///
+/// Skipped images (inline, tracking pixels, SVG, data URIs, duplicate URLs,
+/// beyond [`MAX_BODY_IMAGES`]) are left as tags so `CleanDecorator` keeps
+/// emitting their `[alt]` text.
+pub(crate) fn prepare_body_html(flattened: &str, base_url: Option<&str>) -> PreparedBody {
+    let selector = match Selector::parse("img") {
+        Ok(selector) => selector,
+        // `img` is a static, valid selector; keep the body untouched rather
+        // than losing it if that ever stops being true.
+        Err(_) => {
+            return PreparedBody {
+                html: flattened.to_string(),
+                images: Vec::new(),
+            }
+        }
+    };
+    let doc = Html::parse_fragment(flattened);
+    let block_flags: Vec<bool> = doc.select(&selector).map(is_block_image).collect();
+    let base = base_url.and_then(|url| Url::parse(url).ok());
+
+    let mut html = String::with_capacity(flattened.len());
+    let mut images: Vec<BodyImage> = Vec::new();
+    let mut seen_urls: HashSet<String> = HashSet::new();
+    let mut pos = 0usize;
+    let mut ordinal = 0usize;
+
+    while pos < flattened.len() {
+        let Some(lt_rel) = flattened[pos..].find('<') else {
+            html.push_str(&flattened[pos..]);
+            break;
+        };
+        let lt = pos + lt_rel;
+        html.push_str(&flattened[pos..lt]);
+
+        // Comments may contain `<img` text that the DOM never sees as an
+        // element; copy them verbatim without consuming an ordinal.
+        if flattened[lt..].starts_with("<!--") {
+            match flattened[lt..].find("-->") {
+                Some(end_rel) => {
+                    let end = lt + end_rel + "-->".len();
+                    html.push_str(&flattened[lt..end]);
+                    pos = end;
+                }
+                None => {
+                    html.push_str(&flattened[lt..]);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if !is_img_tag_open(&flattened[lt..]) {
+            html.push('<');
+            pos = lt + 1;
+            continue;
+        }
+
+        // Unterminated tag: leave the rest of the string verbatim.
+        let Some(gt) = find_tag_end(flattened, lt + 1) else {
+            html.push_str(&flattened[lt..]);
+            break;
+        };
+        let tag = &flattened[lt..=gt];
+        let attrs = parse_tag_attrs(tag);
+        let is_block = block_flags.get(ordinal).copied().unwrap_or(false);
+        ordinal += 1;
+
+        let candidate = body_image_from_tag(&attrs, base.as_ref(), &mut seen_urls);
+        match candidate {
+            Some(image) if is_block && images.len() < MAX_BODY_IMAGES => {
+                let index = images.len();
+                images.push(image);
+                html.push(IMG_SENTINEL_START);
+                html.push_str(&index.to_string());
+                html.push(IMG_SENTINEL_END);
+            }
+            _ => html.push_str(tag),
+        }
+        pos = gt + 1;
+    }
+
+    PreparedBody { html, images }
+}
+
+/// True when `s` (which starts at a `<`) opens an `<img>` tag.
+fn is_img_tag_open(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'<' {
+        return false;
+    }
+    if !bytes[1..4].eq_ignore_ascii_case(b"img") {
+        return false;
+    }
+    match bytes.get(4) {
+        Some(b) => b.is_ascii_whitespace() || *b == b'>' || *b == b'/',
+        None => false,
+    }
+}
+
+/// Index of the `>` that closes the tag starting at `from`. The scan is
+/// quote-aware, so a `>` inside a quoted attribute value does not end the
+/// tag.
+fn find_tag_end(s: &str, from: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'>' {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse the attributes of a single raw tag (leading `<` included) into
+/// lowercase name / value pairs. Values are undecorated except for the
+/// `&amp;` entity, the one that would otherwise mangle URLs.
+fn parse_tag_attrs(tag: &str) -> Vec<(String, String)> {
+    let body = tag.strip_prefix('<').unwrap_or(tag);
+    let bytes = body.as_bytes();
+    let mut attrs = Vec::new();
+    let mut i = 0usize;
+    // Skip the tag name.
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/'
+    {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = body[name_start..i].to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value: Option<&str> = None;
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let value_start = i;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                value = Some(&body[value_start..i]);
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                let value_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                    i += 1;
+                }
+                value = Some(&body[value_start..i]);
+            }
+        }
+        if name.is_empty() {
+            // Defensive: guarantee forward progress on malformed markup.
+            i += 1;
+            continue;
+        }
+        attrs.push((name, value.unwrap_or("").replace("&amp;", "&")));
+    }
+    attrs
+}
+
+fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(attr_name, _)| attr_name == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// Declared pixel dimension from `width`/`height`, tolerating a trailing
+/// `px` (and pseudo-values like `100%` fail to parse and read as absent).
+fn attr_u32(attrs: &[(String, String)], name: &str) -> Option<u32> {
+    let value = attr(attrs, name)?.trim();
+    let value =
+        if value.len() >= 2 && value.as_bytes()[value.len() - 2..].eq_ignore_ascii_case(b"px") {
+            value[..value.len() - 2].trim()
+        } else {
+            value
+        };
+    value.parse().ok()
+}
+
+/// Best URL for an image tag: `src`, falling back to `data-src` then
+/// `data-lazy-src` when `src` is missing, empty, or an inline-data /
+/// javascript URI.
+fn raw_image_url(attrs: &[(String, String)]) -> Option<String> {
+    let usable = |name: &str| -> Option<String> {
+        let value = attr(attrs, name)?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let lower = value.to_ascii_lowercase();
+        if lower.starts_with("data:") || lower.starts_with("javascript:") {
+            return None;
+        }
+        Some(value.to_string())
+    };
+    usable("src")
+        .or_else(|| usable("data-src"))
+        .or_else(|| usable("data-lazy-src"))
+}
+
+/// Resolve `raw` against `base`, keeping only http(s) URLs.
+fn resolve_http_url(raw: &str, base: Option<&Url>) -> Option<String> {
+    let resolved = match base {
+        Some(base) => base
+            .join(raw)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| raw.to_string()),
+        None => raw.to_string(),
+    };
+    let lower = resolved.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+/// Build (and dedupe) the [`BodyImage`] for one raw tag. Returns `None` for
+/// images that must keep rendering as alt text (no usable URL, SVG, tiny
+/// tracking pixel, or a repeated URL).
+fn body_image_from_tag(
+    attrs: &[(String, String)],
+    base: Option<&Url>,
+    seen_urls: &mut HashSet<String>,
+) -> Option<BodyImage> {
+    let raw = raw_image_url(attrs)?;
+    let url = resolve_http_url(&raw, base)?;
+
+    let path_end = url.find(['?', '#']).unwrap_or(url.len());
+    if url[..path_end].to_ascii_lowercase().ends_with(".svg") {
+        return None;
+    }
+
+    let declared_w = attr_u32(attrs, "width");
+    let declared_h = attr_u32(attrs, "height");
+    if declared_w.is_some_and(|n| n <= 2) || declared_h.is_some_and(|n| n <= 2) {
+        return None;
+    }
+
+    if !seen_urls.insert(url.clone()) {
+        return None;
+    }
+
+    Some(BodyImage {
+        url,
+        alt: attr(attrs, "alt").unwrap_or("").to_string(),
+        declared_w,
+        declared_h,
+    })
+}
+
+/// True when the image has an ancestor in [`BLOCK_ANCESTORS`] that contains
+/// no text outside `<figcaption>` — i.e. it sits on its own line.
+fn is_block_image(img: ElementRef<'_>) -> bool {
+    match nearest_block_ancestor(img) {
+        Some(ancestor) => ancestor_text_is_blank(ancestor),
+        None => false,
+    }
+}
+
+fn nearest_block_ancestor(img: ElementRef<'_>) -> Option<ElementRef<'_>> {
+    let mut current = img.parent();
+    while let Some(node) = current {
+        if let Some(element) = node.value().as_element() {
+            if BLOCK_ANCESTORS.contains(&element.name()) {
+                return ElementRef::wrap(node);
+            }
+        }
+        current = node.parent();
+    }
+    None
+}
+
+/// True when every descendant text node of `ancestor` is whitespace, except
+/// for text under a `<figcaption>` subtree (a caption is allowed).
+fn ancestor_text_is_blank(ancestor: ElementRef<'_>) -> bool {
+    let ancestor_id = ancestor.id();
+    for node in ancestor.descendants() {
+        let Node::Text(text) = node.value() else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let mut parent = node.parent();
+        let mut in_caption = false;
+        while let Some(current) = parent {
+            if current.id() == ancestor_id {
+                break;
+            }
+            if let Some(element) = current.value().as_element() {
+                if element.name() == "figcaption" {
+                    in_caption = true;
+                    break;
+                }
+            }
+            parent = current.parent();
+        }
+        if !in_caption {
+            return false;
+        }
+    }
+    true
+}
+
 fn format_date(dt: DateTime<Utc>) -> String {
     // Calculate how long ago the item was published
     let now = Utc::now();
@@ -2228,5 +2610,125 @@ mod tests {
         let item = FeedItem::from_feed_entry(&entry);
         assert!(item.media.is_empty());
         assert!(item.thumbnail.is_none());
+    }
+
+    #[test]
+    fn prepare_body_html_keeps_inline_image() {
+        let html = r#"<p>before <img src="https://ex.com/a.png" alt="a"> after</p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert!(prepared.images.is_empty());
+        assert_eq!(prepared.html, html);
+    }
+
+    #[test]
+    fn prepare_body_html_replaces_figure_image_and_keeps_caption() {
+        let html =
+            r#"<figure><img src="/pics/a.png" alt="A"><figcaption>Cap</figcaption></figure>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://ex.com/pics/a.png");
+        assert_eq!(prepared.images[0].alt, "A");
+        assert_eq!(
+            prepared.html,
+            "<figure>\u{E000}0\u{E001}<figcaption>Cap</figcaption></figure>"
+        );
+    }
+
+    #[test]
+    fn prepare_body_html_keeps_gallery_order() {
+        let html = r#"<div><img src="a.png"><img src="b.png"><img src="c.png"></div>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post/"));
+        let urls: Vec<&str> = prepared.images.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://ex.com/post/a.png",
+                "https://ex.com/post/b.png",
+                "https://ex.com/post/c.png"
+            ]
+        );
+        assert!(prepared.html.contains("\u{E000}0\u{E001}"));
+        assert!(prepared.html.contains("\u{E000}1\u{E001}"));
+        assert!(prepared.html.contains("\u{E000}2\u{E001}"));
+    }
+
+    #[test]
+    fn prepare_body_html_skips_beacon_and_uses_data_src() {
+        let html = r#"<div><img src="https://ex.com/px.gif" width="1" height="1"><img src="data:image/png;base64,xx"><img data-src="https://ex.com/real.jpg" alt="real"></div>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://ex.com/real.jpg");
+        assert_eq!(prepared.images[0].alt, "real");
+    }
+
+    #[test]
+    fn prepare_body_html_link_wrapped_image_is_block() {
+        let html = r#"<p><a href="/x"><img src="/a.png"></a></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://ex.com/a.png");
+        assert!(prepared.html.contains("\u{E000}0\u{E001}"));
+        assert!(!prepared.html.contains("<img"));
+    }
+
+    #[test]
+    fn prepare_body_html_skips_svg() {
+        let html = r#"<p><img src="/icon.svg" alt="icon"></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert!(prepared.images.is_empty());
+        assert_eq!(prepared.html, html);
+    }
+
+    #[test]
+    fn prepare_body_html_dedupes_urls() {
+        let html = r#"<div><img src="https://ex.com/a.png"><img src="https://ex.com/a.png"></div>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.html.matches('\u{E000}').count(), 1);
+        // The duplicate tag is left alone so `CleanDecorator` still emits
+        // its alt text.
+        assert_eq!(prepared.html.matches("<img").count(), 1);
+    }
+
+    #[test]
+    fn prepare_body_html_requires_http_base_for_relative_src() {
+        let html = r#"<p><img src="a.png" alt="a"></p>"#;
+        let prepared = prepare_body_html(html, None);
+        assert!(prepared.images.is_empty());
+        assert_eq!(prepared.html, html);
+    }
+
+    #[test]
+    fn prepare_body_html_uses_declared_dimensions() {
+        let html = r#"<p><img src="/a.png" width="640" height="480"></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].declared_w, Some(640));
+        assert_eq!(prepared.images[0].declared_h, Some(480));
+    }
+
+    #[test]
+    fn prepare_body_html_tag_end_is_quote_aware() {
+        // A `>` inside a quoted attribute value must not end the tag.
+        let html = r#"<p><img src="https://ex.com/a.png" alt="a > b"></p>"#;
+        let prepared = prepare_body_html(html, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].alt, "a > b");
+        assert_eq!(prepared.html, "<p>\u{E000}0\u{E001}</p>");
+    }
+
+    #[test]
+    fn prepare_body_html_flattened_table_keeps_ordinals() {
+        // Reddit-style bodies arrive wrapped in a table. Flattening happens
+        // first; discovery and replacement run on that same flattened
+        // string, so the sentinel ordinal must line up with the image.
+        let original = r#"<table><tr><td><div><a href="https://ex.com/post"><img src="https://i.redd.it/x.jpg" alt="x"></a></div></td><td><p>body text</p></td></tr></table>"#;
+        let flattened = flatten_description_html(original);
+        let prepared = prepare_body_html(&flattened, Some("https://ex.com/post"));
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images[0].url, "https://i.redd.it/x.jpg");
+        assert!(prepared.html.contains("\u{E000}0\u{E001}"));
+        assert!(!prepared.html.contains("<img"));
+        assert!(prepared.html.contains("body text"));
     }
 }
