@@ -63,6 +63,20 @@ const MAX_CACHED_IMAGES: usize = 32;
 /// should occupy when constrained to a target row count.
 const CELL_ASPECT: f32 = 0.5;
 
+/// Images transmitted per `pump` call. The transmit writes are the only
+/// multi-megabyte writes in a frame, and a viewport prefetch can make a
+/// dozen images ready at once; anything left over goes out on a later
+/// tick, still rendering its placeholder (or nothing) in the meantime.
+const MAX_TRANSMITS_PER_PUMP: usize = 1;
+
+/// Base64 bytes of image payload written per `pump` call. This is the
+/// looser of the two bounds while [`MAX_TRANSMITS_PER_PUMP`] is 1, and it
+/// exists so raising the per-call count cannot silently write tens of
+/// megabytes. An image that alone exceeds the budget is still sent alone
+/// as the first write of a call — refusing it would stall the queue
+/// forever, because it would stay first in line.
+const TRANSMIT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
 /// Which inline-image protocol the current terminal supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageProtocol {
@@ -112,6 +126,16 @@ pub struct ReadyImage {
     /// Whether the PNG has been transmitted to the terminal. Once true,
     /// re-rendering only emits a placement escape (cheap).
     pub transmitted: bool,
+}
+
+/// Where one ready image should appear, in terminal cells. The detail view
+/// builds these from its placeholder rows; `pump` writes the matching Kitty
+/// virtual placements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementSpec {
+    pub url: String,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Read-only view of the cache for a URL. Callers use this to pick the
@@ -181,6 +205,11 @@ pub struct ImageCache {
     /// Retained by the transitional single-placement shim (`render_at`);
     /// removed once the detail view drives placements through `pump`.
     last_placed_id: Option<u32>,
+    /// Cell size of every virtual placement `pump` has put on screen, keyed
+    /// by image id. A resize only needs to re-emit the placement, never the
+    /// pixel data, so this map is the whole "do the cells still match?"
+    /// state of the placeholder view.
+    last_placement: HashMap<u32, (u16, u16)>,
     /// Kitty ids whose terminal-side pixel data should be freed (their
     /// URL was evicted from our cache, so we'd never place them again).
     /// Deletion needs a writer, which eviction sites don't have — queued
@@ -219,6 +248,7 @@ impl ImageCache {
             in_flight: HashSet::new(),
             client: None,
             last_placed_id: None,
+            last_placement: HashMap::new(),
             pending_deletes: Vec::new(),
         }
     }
@@ -417,6 +447,123 @@ impl ImageCache {
         }
     }
 
+    /// Drive the terminal's image state for one frame: pin `specs`, evict,
+    /// transmit at most one not-yet-sent image, and re-place any transmitted
+    /// image whose cell size changed.
+    ///
+    /// `specs` are the images visible this frame, in the order the detail
+    /// view wants them sent. Write errors propagate (a half-written escape
+    /// leaves the terminal in an unknown state) but are swallowed by the
+    /// TUI, which treats a failed frame as a failed frame. No-op on
+    /// terminals without image support.
+    pub fn pump(&mut self, stdout: &mut impl Write, specs: &[PlacementSpec]) -> io::Result<()> {
+        if self.protocol != ImageProtocol::Kitty {
+            return Ok(());
+        }
+
+        // 1. Everything on screen is pinned for this frame, so the LRU can
+        //    only reclaim URLs the user has scrolled away from. Eviction has
+        //    no writer, so queued deletes (`d=I`: placements + pixel data)
+        //    are flushed here — and, with them, the stale placement sizes of
+        //    those ids, so a later re-fetch can't be suppressed by them.
+        self.set_pinned(specs.iter().map(|s| s.url.clone()).collect());
+        self.flush_pending_deletes(stdout)?;
+
+        // 2. Re-place images that are already in the terminal's registry but
+        //    whose cells changed (resize / rewrap). No re-transmit: the
+        //    pixel data is keyed by image id and still valid.
+        for spec in specs {
+            if let Some(id) = self.transmitted_id(&spec.url) {
+                self.sync_placement(stdout, id, spec.cols, spec.rows)?;
+            }
+        }
+
+        // 3. Spend the transmit budget on the first spec that is ready but
+        //    not yet in the terminal. A `Ready` entry without a payload is
+        //    *not* ready: the PNG was already taken (or never existed), so
+        //    sending nothing would leave `transmitted` lying about what the
+        //    terminal holds.
+        let mut written_bytes = 0usize;
+        let mut sent = 0usize;
+        for spec in specs {
+            if sent >= MAX_TRANSMITS_PER_PUMP {
+                break;
+            }
+            let Some((id, png)) = self.pending_payload(&spec.url) else {
+                continue;
+            };
+            // Upper bound on what the encoder will produce for this payload.
+            let encoded_len = base64::encoded_len(png.len(), true).unwrap_or(usize::MAX);
+            if written_bytes > 0 && written_bytes.saturating_add(encoded_len) > TRANSMIT_BUDGET_BYTES
+            {
+                break;
+            }
+            let payload = BASE64.encode(png.as_slice());
+            transmit_kitty_base64(stdout, &payload, id)?;
+            // Place before flipping any state: if either write fails, the
+            // entry keeps its payload and `transmitted == false`, so the
+            // next pump retries. Re-sending the same id is idempotent —
+            // Kitty replaces that image's pixel data.
+            place_virtual_image(stdout, id, spec.cols, spec.rows)?;
+            if let Some(Entry::Ready { image, png }) = self.entries.get_mut(&spec.url) {
+                image.transmitted = true;
+                *png = None;
+            }
+            self.last_placement.insert(id, (spec.cols, spec.rows));
+            written_bytes = written_bytes.saturating_add(encoded_len);
+            sent += 1;
+        }
+        Ok(())
+    }
+
+    /// Id of a `Ready` entry whose pixel data is already in the terminal.
+    fn transmitted_id(&self, url: &str) -> Option<u32> {
+        match self.entries.get(url) {
+            Some(Entry::Ready { image, .. }) if image.transmitted => Some(image.id),
+            _ => None,
+        }
+    }
+
+    /// `(id, png)` of a `Ready` entry that still has payload to send. The
+    /// PNG is an `Arc`, so this peek costs a refcount bump, not a copy.
+    fn pending_payload(&self, url: &str) -> Option<(u32, Arc<Vec<u8>>)> {
+        match self.entries.get(url) {
+            Some(Entry::Ready {
+                image,
+                png: Some(png),
+            }) if !image.transmitted => Some((image.id, Arc::clone(png))),
+            _ => None,
+        }
+    }
+
+    /// Re-emit the virtual placement for `id` if its cells changed, and
+    /// record the size this frame asked for.
+    fn sync_placement(
+        &mut self,
+        stdout: &mut impl Write,
+        id: u32,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<()> {
+        match self.last_placement.get(&id) {
+            // Same cells: the terminal already has this placement.
+            Some(&placed) if placed == (cols, rows) => Ok(()),
+            Some(_) => {
+                place_virtual_image(stdout, id, cols, rows)?;
+                self.last_placement.insert(id, (cols, rows));
+                Ok(())
+            }
+            // Nothing recorded: this id was transmitted outside `pump` (the
+            // transitional `render_at` shim, or a test fixture). Record the
+            // requested size without re-emitting — a re-place is only owed
+            // once the size actually changes.
+            None => {
+                self.last_placement.insert(id, (cols, rows));
+                Ok(())
+            }
+        }
+    }
+
     /// **Transitional shim.** Place `url` at the top-left of `rect`, sized
     /// to fit within `rect`. Returns true if anything was written to
     /// stdout. No-op on non-Kitty terminals.
@@ -517,8 +664,13 @@ impl ImageCache {
     /// Emit `d=I` (uppercase: delete placements AND free pixel data) for
     /// every id whose URL was evicted from the cache. Queued at eviction
     /// time because eviction sites have no writer.
+    ///
+    /// Eviction also forgets the id's recorded placement size: the terminal
+    /// no longer holds that image, and any future placement comes from a
+    /// fresh fetch with a fresh id.
     fn flush_pending_deletes(&mut self, stdout: &mut impl Write) -> io::Result<()> {
         for id in self.pending_deletes.drain(..) {
+            self.last_placement.remove(&id);
             write!(stdout, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id)?;
         }
         Ok(())
@@ -671,7 +823,13 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 /// Send a PNG to the terminal under image id `id`, chunked at 4096 base64
 /// bytes per Kitty's protocol. Subsequent placements reference the id.
 fn transmit_kitty_image(stdout: &mut impl Write, png: &[u8], id: u32) -> io::Result<()> {
-    let b64 = BASE64.encode(png);
+    transmit_kitty_base64(stdout, &BASE64.encode(png), id)
+}
+
+/// Send an already-encoded PNG payload to the terminal under image id `id`.
+/// `pump` encodes once and measures the payload before writing it, so the
+/// chunking lives here rather than behind the encoder.
+fn transmit_kitty_base64(stdout: &mut impl Write, b64: &str, id: u32) -> io::Result<()> {
     let chunk_size = 4096;
     let total_chunks = b64.len().div_ceil(chunk_size);
     for (i, chunk) in b64.as_bytes().chunks(chunk_size).enumerate() {
@@ -687,6 +845,21 @@ fn transmit_kitty_image(stdout: &mut impl Write, png: &[u8], id: u32) -> io::Res
         stdout.write_all(b"\x1b\\")?;
     }
     Ok(())
+}
+
+/// Place a transmitted image through its Unicode placeholder cells.
+///
+/// `U=1` makes the terminal draw the image wherever the placeholder cells
+/// (`U+10EEEE` + row/column diacritics) for image `id` appear, so the image
+/// scrolls and clips with the buffer instead of being pinned to the cursor.
+/// `p=1` keeps exactly one placement per image id, so a resize replaces it
+/// instead of stacking a second copy.
+fn place_virtual_image(stdout: &mut impl Write, id: u32, cols: u16, rows: u16) -> io::Result<()> {
+    write!(
+        stdout,
+        "\x1b_Ga=p,U=1,i={},p=1,c={},r={},q=2;\x1b\\",
+        id, cols, rows
+    )
 }
 
 /// Place a transmitted image at the current cursor with the given cell
@@ -1139,5 +1312,165 @@ mod tests {
             "expected terminal-data delete for {old_id} in: {s}"
         );
         assert!(cache.pending_deletes.is_empty());
+    }
+
+    // ── transmit budget and virtual placements (pump) ─────────────────────
+
+    /// Spec naming `url` in `cols` x `rows` cells.
+    fn spec(url: &str, cols: u16, rows: u16) -> PlacementSpec {
+        PlacementSpec {
+            url: url.to_string(),
+            cols,
+            rows,
+        }
+    }
+
+    #[test]
+    fn pump_transmits_one_image_per_call_then_places_it() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        cache.insert_ready_for_test("a", 1, 40, 10, false);
+        cache.insert_ready_for_test("b", 2, 40, 10, false);
+        let specs = [spec("a", 40, 10), spec("b", 40, 10)];
+
+        let mut out = Vec::new();
+        cache.pump(&mut out, &specs).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s.matches("a=t").count(), 1, "{s}");
+        assert!(s.contains("a=p,U=1,i="), "{s}");
+
+        let mut out2 = Vec::new();
+        cache.pump(&mut out2, &specs).unwrap();
+        assert!(String::from_utf8_lossy(&out2).contains("a=t"));
+
+        let mut out3 = Vec::new();
+        cache.pump(&mut out3, &specs).unwrap();
+        assert!(out3.is_empty(), "both transmitted and placed: {:?}", out3);
+    }
+
+    #[test]
+    fn pump_replaces_virtual_placement_on_resize_without_retransmit() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        cache.insert_ready_for_test("a", 1, 40, 10, true);
+        let mut out = Vec::new();
+        cache.pump(&mut out, &[spec("a", 40, 10)]).unwrap();
+        assert!(out.is_empty());
+
+        let mut resized = Vec::new();
+        cache.pump(&mut resized, &[spec("a", 60, 15)]).unwrap();
+        let s = String::from_utf8_lossy(&resized);
+        assert!(s.contains("a=p,U=1,i=1,p=1,c=60,r=15"), "{s}");
+        assert!(!s.contains("a=t"), "{s}");
+    }
+
+    #[test]
+    fn pump_does_nothing_on_none_protocol() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::None);
+        cache.insert_ready_for_test("a", 1, 40, 10, false);
+
+        let mut out = Vec::new();
+        cache.pump(&mut out, &[spec("a", 40, 10)]).unwrap();
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn pump_frees_evicted_terminal_data() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        cache.insert_ready_for_test("https://x/old.png", 4242, 8, 8, true);
+        // Push the transmitted image out of the LRU; eviction has no writer,
+        // so the `d=I` is only queued.
+        for i in 0..MAX_CACHED_IMAGES {
+            cache.insert_ready_for_test(
+                &format!("https://x/fill-{i}.png"),
+                100 + i as u32,
+                8,
+                8,
+                false,
+            );
+        }
+        assert!(matches!(
+            cache.view("https://x/old.png"),
+            ImageView::Missing
+        ));
+        assert_eq!(cache.pending_deletes, vec![4242]);
+
+        let mut out = Vec::new();
+        cache.pump(&mut out, &[]).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("a=d,d=I,i=4242,q=2"), "{s}");
+        assert!(cache.pending_deletes.is_empty());
+        assert!(
+            !cache.last_placement.contains_key(&4242),
+            "eviction must not leave stale placement state behind"
+        );
+    }
+
+    #[test]
+    fn pump_pins_spec_urls_against_eviction() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        let urls: Vec<String> = (0..MAX_CACHED_IMAGES)
+            .map(|i| format!("https://x/pinned-{i}.png"))
+            .collect();
+        for (i, url) in urls.iter().enumerate() {
+            cache.insert_ready_for_test(url, i as u32 + 1, 8, 8, false);
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES);
+
+        let specs: Vec<PlacementSpec> = urls.iter().map(|u| spec(u, 8, 4)).collect();
+        let mut out = Vec::new();
+        cache.pump(&mut out, &specs).unwrap();
+
+        // A 33rd insertion cannot evict anything: every existing URL is
+        // pinned by the specs, so the newcomer is the only evictable entry.
+        cache.insert_ready_for_test("https://x/newcomer.png", 999, 8, 8, false);
+        for url in &urls {
+            assert!(
+                cache.has_image(url),
+                "pinned URL {url} must survive eviction"
+            );
+        }
+        assert!(matches!(
+            cache.view("https://x/newcomer.png"),
+            ImageView::Missing
+        ));
+    }
+
+    #[test]
+    fn pump_skips_ready_entry_that_lost_its_payload() {
+        let mut cache = ImageCache::new();
+        cache.force_protocol(ImageProtocol::Kitty);
+        // Reachable after a transmit I/O error, and from test fixtures: the
+        // entry is `Ready` but has no PNG to send. It must never be marked
+        // transmitted or placed — the terminal has nothing to draw.
+        cache.insert_entry(
+            "https://x/hollow.png".to_string(),
+            Entry::Ready {
+                image: ReadyImage {
+                    id: 9,
+                    width: 8,
+                    height: 8,
+                    transmitted: false,
+                },
+                png: None,
+            },
+        );
+
+        let mut out = Vec::new();
+        cache
+            .pump(&mut out, &[spec("https://x/hollow.png", 8, 4)])
+            .unwrap();
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        match cache.view("https://x/hollow.png") {
+            ImageView::Ready(img) => assert!(!img.transmitted, "must not claim transmission"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(
+            cache.last_placement.is_empty(),
+            "must not place an image the terminal never received"
+        );
     }
 }
