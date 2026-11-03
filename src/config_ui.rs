@@ -303,12 +303,12 @@ pub fn render<B: Backend>(f: &mut Frame<B>, editor: &ConfigEditor) {
         };
 
         let url_display = if editor.add_field_focus == 0 {
-            format!("{}█", &editor.add_url_buffer)
+            format!("{}█", editor.add_url_buffer)
         } else {
             editor.add_url_buffer.clone()
         };
         let cat_display = if editor.add_field_focus == 1 {
-            format!("{}█", &editor.add_category_buffer)
+            format!("{}█", editor.add_category_buffer)
         } else {
             editor.add_category_buffer.clone()
         };

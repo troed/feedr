@@ -57,12 +57,6 @@ const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
 /// cache may grow past the cap, bounded by the 40-image article cap.
 const MAX_CACHED_IMAGES: usize = 32;
 
-/// Heuristic ratio of (cell width / cell height) in pixels. Most modern
-/// fixed-pitch fonts hit ~0.5 — cells are roughly twice as tall as wide.
-/// Used to compute how many *columns* an image of a given pixel aspect
-/// should occupy when constrained to a target row count.
-const CELL_ASPECT: f32 = 0.5;
-
 /// Images transmitted per `pump` call. The transmit writes are the only
 /// multi-megabyte writes in a frame, and a viewport prefetch can make a
 /// dozen images ready at once; anything left over goes out on a later
@@ -221,10 +215,6 @@ pub struct ImageCache {
     /// fetches via `&mut App` without the caller threading a client
     /// through every UI layer. Construction is cheap relative to a fetch.
     client: Option<reqwest::blocking::Client>,
-    /// Kitty image id of the placement currently on screen, if any.
-    /// Retained by the transitional single-placement shim (`render_at`);
-    /// removed once the detail view drives placements through `pump`.
-    last_placed_id: Option<u32>,
     /// Cell size of every virtual placement `pump` has put on screen, keyed
     /// by image id. A resize only needs to re-emit the placement, never the
     /// pixel data, so this map is the whole "do the cells still match?"
@@ -233,7 +223,7 @@ pub struct ImageCache {
     /// Kitty ids whose terminal-side pixel data should be freed (their
     /// URL was evicted from our cache, so we'd never place them again).
     /// Deletion needs a writer, which eviction sites don't have — queued
-    /// here and flushed by `render_at` / `clear_terminal`.
+    /// here and flushed by `pump`.
     pending_deletes: Vec<u32>,
 }
 
@@ -267,7 +257,6 @@ impl ImageCache {
             receiver,
             in_flight: HashSet::new(),
             client: None,
-            last_placed_id: None,
             last_placement: HashMap::new(),
             pending_deletes: Vec::new(),
         }
@@ -291,22 +280,6 @@ impl ImageCache {
             Some(Entry::InFlight) => ImageView::Loading,
             Some(Entry::Ready { image, .. }) => ImageView::Ready(image),
             Some(Entry::Failed) => ImageView::Failed,
-        }
-    }
-
-    /// True iff an encoded image is ready for this URL (independent of
-    /// whether the PNG has been transmitted yet — that's lazy).
-    pub fn has_image(&self, url: &str) -> bool {
-        matches!(self.view(url), ImageView::Ready(_))
-    }
-
-    /// Compute the (cols, rows) the image should occupy when constrained
-    /// to `(max_cols, max_rows)` cells, preserving the image's aspect.
-    /// Returns None if the image isn't ready yet.
-    pub fn display_cells(&self, url: &str, max_cols: usize, max_rows: usize) -> Option<(u16, u16)> {
-        match self.view(url) {
-            ImageView::Ready(img) => Some(fit_cells(img.width, img.height, max_cols, max_rows)),
-            _ => None,
         }
     }
 
@@ -574,111 +547,13 @@ impl ImageCache {
                 self.last_placement.insert(id, (cols, rows));
                 Ok(())
             }
-            // Nothing recorded: this id was transmitted outside `pump` (the
-            // transitional `render_at` shim, or a test fixture). Record the
-            // requested size without re-emitting — a re-place is only owed
-            // once the size actually changes.
+            // Nothing recorded: no re-place is owed yet. Record the size so
+            // a later change is detected without a redundant escape.
             None => {
                 self.last_placement.insert(id, (cols, rows));
                 Ok(())
             }
         }
-    }
-
-    /// **Transitional shim.** Place `url` at the top-left of `rect`, sized
-    /// to fit within `rect`. Returns true if anything was written to
-    /// stdout. No-op on non-Kitty terminals.
-    ///
-    /// The detail view drives placements through the placeholder path now;
-    /// this shim remains only for its own tests until Task 11 deletes it.
-    pub fn render_at(
-        &mut self,
-        stdout: &mut impl Write,
-        url: &str,
-        rect_col: u16,
-        rect_row: u16,
-        max_cols: u16,
-        max_rows: u16,
-    ) -> io::Result<bool> {
-        if self.protocol != ImageProtocol::UnicodePlaceholders {
-            return Ok(false);
-        }
-        let (id, width, height) = match self.view(url) {
-            ImageView::Ready(img) => (img.id, img.width, img.height),
-            _ => return Ok(false),
-        };
-        // Free terminal-side data for any ids evicted since the last write.
-        self.flush_pending_deletes(stdout)?;
-
-        // Size the placement: respect both rect bounds AND image aspect.
-        let (cols, rows) = fit_cells(width, height, max_cols as usize, max_rows as usize);
-        if cols == 0 || rows == 0 {
-            return Ok(false);
-        }
-
-        // Position cursor at the rect's top-left in raw 1-based coords.
-        // crossterm's MoveTo is 0-based, so emit the CSI directly to stay
-        // independent of which Writer the caller uses (stdout, BufWriter…).
-        write!(stdout, "\x1b[{};{}H", rect_row + 1, rect_col + 1)?;
-
-        let pending_png = match self.entries.get_mut(url) {
-            Some(Entry::Ready { image, png }) => {
-                if image.transmitted {
-                    None
-                } else {
-                    // `Some(None)` = ready to transmit, no payload attached
-                    // (only reachable for test-injected entries).
-                    Some(png.take())
-                }
-            }
-            _ => return Ok(false),
-        };
-        if let Some(png) = pending_png {
-            let bytes: &[u8] = png.as_deref().map(Vec::as_slice).unwrap_or(&[]);
-            transmit_kitty_image(stdout, bytes, id)?;
-            if let Some(Entry::Ready { image, .. }) = self.entries.get_mut(url) {
-                image.transmitted = true;
-            }
-        }
-
-        // Placements are keyed by (image id, placement id). Re-placing the
-        // SAME image id with p=1 replaces the previous placement, but a
-        // DIFFERENT image id would stack on top of the old one — so when
-        // switching images within a frame-pair, delete the old image's
-        // placement first (d=i, lowercase: placement only, its pixel data
-        // stays cached terminal-side for a cheap re-place later).
-        if let Some(old) = self.last_placed_id {
-            if old != id {
-                write!(stdout, "\x1b_Ga=d,d=i,i={},q=2\x1b\\", old)?;
-            }
-        }
-        place_kitty_image(stdout, id, cols, rows)?;
-        self.last_placed_id = Some(id);
-        // Leave the cursor in a sane spot below the image so the next
-        // ratatui frame's diff doesn't get confused.
-        write!(stdout, "\x1b[{};1H", rect_row + rows + 1)?;
-        Ok(true)
-    }
-
-    /// **Transitional shim.** Tell the terminal to drop every Kitty
-    /// *placement* (`d=a`, lowercase: the transmitted pixel data stays in
-    /// the terminal's image registry). Call when leaving any view that was
-    /// showing an image so it doesn't bleed into the next view's cells.
-    /// Keeps cached entries and their `transmitted` flags intact, so
-    /// re-entering the view is a single cheap placement escape, with no
-    /// PNG re-transmit. Terminal data is freed only when a URL ages out of
-    /// our LRU (`d=I` via `pending_deletes`), keeping the terminal's copy
-    /// bounded by `MAX_CACHED_IMAGES`.
-    pub fn clear_terminal(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        if self.protocol != ImageProtocol::UnicodePlaceholders {
-            return Ok(());
-        }
-        self.flush_pending_deletes(stdout)?;
-        // a=d (delete), d=a (all visible placements). q=2 suppresses the
-        // terminal's response.
-        stdout.write_all(b"\x1b_Ga=d,d=a,q=2\x1b\\")?;
-        self.last_placed_id = None;
-        Ok(())
     }
 
     /// Emit `d=I` (uppercase: delete placements AND free pixel data) for
@@ -807,44 +682,8 @@ fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn fit_cells(src_w: u32, src_h: u32, max_cols: usize, max_rows: usize) -> (u16, u16) {
-    let aspect = if src_h == 0 {
-        1.0
-    } else {
-        src_w as f32 / src_h as f32
-    };
-    fit_cells_with_aspect(aspect, max_cols, max_rows)
-}
-
-/// Pick (cols, rows) that preserves `src_aspect` (w/h in pixels), respecting
-/// terminal cell aspect via `CELL_ASPECT` and clamping to `(max_cols, max_rows)`.
-fn fit_cells_with_aspect(src_aspect: f32, max_cols: usize, max_rows: usize) -> (u16, u16) {
-    // Convert pixel-aspect → cell-aspect. A "square" pixel image of side N
-    // needs N*CELL_ASPECT cols of width per row of height to look square.
-    // i.e. cell_aspect = pixel_aspect / CELL_ASPECT.
-    let cell_aspect = src_aspect / CELL_ASPECT;
-    // Try fitting to width first.
-    let cols_from_rows = (max_rows as f32 * cell_aspect).round() as usize;
-    let rows_from_cols = (max_cols as f32 / cell_aspect).round() as usize;
-    let (cols, rows) = if cols_from_rows <= max_cols {
-        (cols_from_rows, max_rows)
-    } else {
-        (max_cols, rows_from_cols)
-    };
-    (
-        cols.min(max_cols).max(1) as u16,
-        rows.min(max_rows).max(1) as u16,
-    )
-}
-
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
-
-/// Send a PNG to the terminal under image id `id`, chunked at 4096 base64
-/// bytes per Kitty's protocol. Subsequent placements reference the id.
-fn transmit_kitty_image(stdout: &mut impl Write, png: &[u8], id: u32) -> io::Result<()> {
-    transmit_kitty_base64(stdout, &BASE64.encode(png), id)
-}
 
 /// Send an already-encoded PNG payload to the terminal under image id `id`.
 /// `pump` encodes once and measures the payload before writing it, so the
@@ -882,53 +721,9 @@ fn place_virtual_image(stdout: &mut impl Write, id: u32, cols: u16, rows: u16) -
     )
 }
 
-/// Place a transmitted image at the current cursor with the given cell
-/// dimensions. `c` = columns, `r` = rows; the terminal scales to fit.
-/// The explicit placement id (`p=1`) makes re-placement idempotent:
-/// placements are keyed by (image id, placement id), so emitting this
-/// every frame replaces the previous placement instead of accumulating
-/// new ones in the terminal.
-fn place_kitty_image(stdout: &mut impl Write, id: u32, cols: u16, rows: u16) -> io::Result<()> {
-    write!(
-        stdout,
-        "\x1b_Ga=p,i={},p=1,q=2,c={},r={};\x1b\\",
-        id, cols, rows
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── fit_cells ────────────────────────────────────────────────────────
-
-    #[test]
-    fn fit_cells_square_image() {
-        // A square pixel image in a 40x20 cell area. With CELL_ASPECT=0.5,
-        // cells are 2x as tall as wide, so a square fits as cols = 2*rows.
-        // At max_rows=20 → cols_from_rows = 40 → exactly fits.
-        let (c, r) = fit_cells(100, 100, 40, 20);
-        assert_eq!(r, 20);
-        assert_eq!(c, 40);
-    }
-
-    #[test]
-    fn fit_cells_wide_image() {
-        // 2:1 pixel-aspect → cell-aspect = 2/0.5 = 4. In a 40x20 area,
-        // width-bound: rows_from_cols = 40/4 = 10.
-        let (c, r) = fit_cells(200, 100, 40, 20);
-        assert_eq!(c, 40);
-        assert_eq!(r, 10);
-    }
-
-    #[test]
-    fn fit_cells_clamps_to_at_least_one() {
-        // Tiny target should still yield at least 1x1.
-        let (c, r) = fit_cells(100, 100, 1, 1);
-        assert!(c >= 1);
-        assert!(r >= 1);
-    }
 
     // ── entry model (PNG-only cache) ─────────────────────────────────────
 
@@ -1128,7 +923,10 @@ mod tests {
         // Mark as known-failed.
         cache.insert_state_for_test("http://example.com/x.png", TestState::Failed);
         assert!(cache.entries.contains_key("http://example.com/x.png"));
-        assert!(!cache.has_image("http://example.com/x.png"));
+        assert!(!matches!(
+            cache.view("http://example.com/x.png"),
+            ImageView::Ready(_)
+        ));
     }
 
     #[test]
@@ -1153,7 +951,10 @@ mod tests {
             cache.view("http://127.0.0.1/x.png"),
             ImageView::Failed
         ));
-        assert!(!cache.has_image("http://127.0.0.1/x.png"));
+        assert!(!matches!(
+            cache.view("http://127.0.0.1/x.png"),
+            ImageView::Ready(_)
+        ));
         assert!(!cache.in_flight.contains("http://127.0.0.1/x.png"));
     }
 
@@ -1169,7 +970,10 @@ mod tests {
         // The three oldest are gone, the newest survive.
         assert!(matches!(cache.view("https://x/0.png"), ImageView::Missing));
         assert!(matches!(cache.view("https://x/2.png"), ImageView::Missing));
-        assert!(cache.has_image(&format!("https://x/{}.png", MAX_CACHED_IMAGES + 2)));
+        assert!(matches!(
+            cache.view(&format!("https://x/{}.png", MAX_CACHED_IMAGES + 2)),
+            ImageView::Ready(_)
+        ));
     }
 
     #[test]
@@ -1178,7 +982,7 @@ mod tests {
         cache.insert_state_for_test("https://x/a.png", TestState::Failed);
         cache.insert_ready_for_test("https://x/a.png", 9, 8, 8, false);
         assert_eq!(cache.order.len(), 1);
-        assert!(cache.has_image("https://x/a.png"));
+        assert!(matches!(cache.view("https://x/a.png"), ImageView::Ready(_)));
     }
 
     #[test]
@@ -1215,12 +1019,12 @@ mod tests {
     }
 
     #[test]
-    fn transmit_kitty_image_chunks_correctly() {
+    fn transmit_kitty_base64_chunks_correctly() {
         // Build a PNG large enough to require chunking.
         let img = DynamicImage::new_rgb8(128, 128);
         let png = encode_png(&img).unwrap();
         let mut out: Vec<u8> = Vec::new();
-        transmit_kitty_image(&mut out, &png, 42).unwrap();
+        transmit_kitty_base64(&mut out, &BASE64.encode(&png), 42).unwrap();
         let s = String::from_utf8_lossy(&out);
         // First chunk has the full control payload.
         assert!(s.contains("a=t,f=100,t=d,i=42,q=2"));
@@ -1229,143 +1033,12 @@ mod tests {
         assert!(s.ends_with("\x1b\\"));
     }
 
-    #[test]
-    fn place_kitty_image_formats_csi() {
-        let mut out: Vec<u8> = Vec::new();
-        place_kitty_image(&mut out, 7, 30, 12).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b_Ga=p,i=7,p=1,q=2,c=30,r=12;\x1b\\");
-    }
-
-    // ── placement / terminal-data lifecycle (transitional shim) ─────────
-
-    /// Build a Kitty-mode cache with ready images already in place.
-    fn cache_with_images(urls: &[&str]) -> ImageCache {
-        let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
-        for (i, url) in urls.iter().enumerate() {
-            cache.insert_ready_for_test(url, i as u32 + 1, 8, 8, false);
-        }
-        cache
-    }
-
     /// Id of the ready entry for `url`.
     fn ready_id(cache: &ImageCache, url: &str) -> u32 {
         match cache.view(url) {
             ImageView::Ready(img) => img.id,
             other => panic!("expected Ready for {url}, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn clear_terminal_deletes_placements_only_and_keeps_transmit_state() {
-        let mut cache = cache_with_images(&["https://x/a.png"]);
-        let mut out: Vec<u8> = Vec::new();
-        assert!(cache
-            .render_at(&mut out, "https://x/a.png", 0, 0, 40, 10)
-            .unwrap());
-        let first = String::from_utf8_lossy(&out).to_string();
-        assert!(first.contains("a=t"), "first render transmits the PNG");
-
-        // View-change clear: placements-only (lowercase d=a), never d=A —
-        // the terminal keeps the pixel data so re-entry is cheap.
-        let mut cleared: Vec<u8> = Vec::new();
-        cache.clear_terminal(&mut cleared).unwrap();
-        let cleared = String::from_utf8_lossy(&cleared).to_string();
-        assert!(
-            cleared.contains("a=d,d=a"),
-            "expected placement-only clear in: {cleared}"
-        );
-        assert!(
-            !cleared.contains("d=A"),
-            "must not free terminal data on view change"
-        );
-        assert!(cache.last_placed_id.is_none());
-
-        // Re-entering the view re-places without re-encoding/re-transmitting.
-        let mut out2: Vec<u8> = Vec::new();
-        assert!(cache
-            .render_at(&mut out2, "https://x/a.png", 0, 0, 40, 10)
-            .unwrap());
-        let second = String::from_utf8_lossy(&out2).to_string();
-        assert!(
-            !second.contains("a=t"),
-            "re-render must not retransmit: {second}"
-        );
-        assert!(
-            second.contains("a=p"),
-            "re-render places the retained image"
-        );
-    }
-
-    #[test]
-    fn switching_images_deletes_previous_placement() {
-        // Regression lock for placement stacking: placements are keyed by
-        // (image id, placement id), so placing image B with p=1 does NOT
-        // replace image A's (id_a, p=1) placement — render_at must delete
-        // it explicitly when the displayed image changes.
-        let mut cache = cache_with_images(&["https://x/a.png", "https://x/b.png"]);
-        let mut out: Vec<u8> = Vec::new();
-        cache
-            .render_at(&mut out, "https://x/a.png", 0, 0, 40, 10)
-            .unwrap();
-        let id_a = ready_id(&cache, "https://x/a.png");
-
-        let mut out_b: Vec<u8> = Vec::new();
-        cache
-            .render_at(&mut out_b, "https://x/b.png", 0, 0, 40, 10)
-            .unwrap();
-        let s = String::from_utf8_lossy(&out_b).to_string();
-        assert!(
-            s.contains(&format!("a=d,d=i,i={},q=2", id_a)),
-            "expected placement delete for image {id_a} in: {s}"
-        );
-        // Same-image re-render must NOT delete its own placement.
-        let mut out_b2: Vec<u8> = Vec::new();
-        cache
-            .render_at(&mut out_b2, "https://x/b.png", 0, 0, 40, 10)
-            .unwrap();
-        let s2 = String::from_utf8_lossy(&out_b2).to_string();
-        assert!(
-            !s2.contains("a=d,d=i"),
-            "same image re-place needs no delete: {s2}"
-        );
-    }
-
-    #[test]
-    fn lru_eviction_frees_terminal_data_on_next_flush() {
-        let mut cache = cache_with_images(&["https://x/old.png"]);
-        let mut out: Vec<u8> = Vec::new();
-        cache
-            .render_at(&mut out, "https://x/old.png", 0, 0, 40, 10)
-            .unwrap();
-        let old_id = ready_id(&cache, "https://x/old.png");
-
-        // Push the transmitted image out of the LRU.
-        for i in 0..MAX_CACHED_IMAGES {
-            cache.insert_ready_for_test(
-                &format!("https://x/fill-{i}.png"),
-                100 + i as u32,
-                8,
-                8,
-                false,
-            );
-        }
-        assert!(matches!(
-            cache.view("https://x/old.png"),
-            ImageView::Missing
-        ));
-        assert_eq!(cache.pending_deletes, vec![old_id]);
-
-        // The next write flushes a d=I (placements + pixel data) for it.
-        let mut cleared: Vec<u8> = Vec::new();
-        cache.clear_terminal(&mut cleared).unwrap();
-        let s = String::from_utf8_lossy(&cleared).to_string();
-        assert!(
-            s.contains(&format!("a=d,d=I,i={},q=2", old_id)),
-            "expected terminal-data delete for {old_id} in: {s}"
-        );
-        assert!(cache.pending_deletes.is_empty());
     }
 
     // ── transmit budget and virtual placements (pump) ─────────────────────
@@ -1483,7 +1156,7 @@ mod tests {
         cache.insert_ready_for_test("https://x/newcomer.png", 999, 8, 8, false);
         for url in &urls {
             assert!(
-                cache.has_image(url),
+                matches!(cache.view(url), ImageView::Ready(_)),
                 "pinned URL {url} must survive eviction"
             );
         }
