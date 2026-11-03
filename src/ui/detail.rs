@@ -61,7 +61,8 @@ pub(super) fn render_item_detail<B: Backend>(
             if !app.compact
                 && area.height >= MIN_AREA_HEIGHT_FOR_IMAGE
                 && app.image_cache.has_image(url)
-                && app.image_cache.protocol() == crate::image::ImageProtocol::Kitty =>
+                && app.image_cache.protocol()
+                    == crate::image::ImageProtocol::UnicodePlaceholders =>
         {
             IMAGE_STRIP_ROWS
         }

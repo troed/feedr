@@ -957,7 +957,7 @@ mod tests {
         // Kitty, so the detail renderer reserves the strip and queues a
         // placement.
         app.image_cache
-            .force_protocol(crate::image::ImageProtocol::Kitty);
+            .force_protocol(crate::image::ImageProtocol::UnicodePlaceholders);
         // Test-only ready entry: the thumbnail is already encoded, so the
         // detail renderer reserves the strip and queues a placement.
         app.image_cache
@@ -1003,7 +1003,7 @@ mod tests {
         app.selected_feed = Some(0);
         app.selected_item = Some(0);
         app.image_cache
-            .force_protocol(crate::image::ImageProtocol::Kitty);
+            .force_protocol(crate::image::ImageProtocol::UnicodePlaceholders);
         // Test-only ready entry: the thumbnail is already encoded, so the
         // detail renderer reserves the strip and queues a placement.
         app.image_cache

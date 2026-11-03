@@ -78,39 +78,59 @@ const MAX_TRANSMITS_PER_PUMP: usize = 1;
 const TRANSMIT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Which inline-image protocol the current terminal supports.
+///
+/// Only Kitty and Ghostty implement the `U=1` Unicode-placeholder variant
+/// this renderer relies on. Everything else (including WezTerm and tmux)
+/// falls back to alt text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageProtocol {
-    Kitty,
+    UnicodePlaceholders,
     None,
 }
 
-/// Detect the terminal's inline-image capability from env. We treat any
-/// terminal that *speaks* Kitty's graphics protocol as Kitty, including
-/// Ghostty (which implements the protocol natively).
-pub fn detect_protocol() -> ImageProtocol {
+/// Pure terminal-capability decision, split out from env reads so it is
+/// testable without mutating process-global state.
+fn protocol_for(
+    tmux: bool,
+    kitty_window: bool,
+    term: Option<&str>,
+    term_program: Option<&str>,
+) -> ImageProtocol {
     // tmux inherits KITTY_WINDOW_ID / TERM_PROGRAM from the outer terminal
     // but swallows raw APC sequences (no passthrough support here yet), so
-    // the image would never appear.
-    if std::env::var_os("TMUX").is_some() {
+    // the image would never appear while the strip still gets reserved.
+    if tmux {
         return ImageProtocol::None;
     }
     // Kitty itself.
-    if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-        return ImageProtocol::Kitty;
+    if kitty_window {
+        return ImageProtocol::UnicodePlaceholders;
     }
-    if let Ok(term) = std::env::var("TERM") {
+    if let Some(term) = term {
         let term = term.to_lowercase();
         if term.contains("kitty") || term.contains("ghostty") {
-            return ImageProtocol::Kitty;
+            return ImageProtocol::UnicodePlaceholders;
         }
     }
-    if let Ok(prog) = std::env::var("TERM_PROGRAM") {
-        let prog = prog.to_lowercase();
-        if prog == "ghostty" || prog == "wezterm" {
-            return ImageProtocol::Kitty;
+    // Ghostty sets TERM_PROGRAM; WezTerm deliberately does not qualify
+    // because it does not implement `U=1` placeholders yet.
+    if let Some(prog) = term_program {
+        if prog.eq_ignore_ascii_case("ghostty") {
+            return ImageProtocol::UnicodePlaceholders;
         }
     }
     ImageProtocol::None
+}
+
+/// Detect the terminal's inline-image capability from env and delegate to
+/// [`protocol_for`].
+pub fn detect_protocol() -> ImageProtocol {
+    protocol_for(
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    )
 }
 
 /// A cached image whose PNG is ready to transmit, with the source
@@ -457,7 +477,7 @@ impl ImageCache {
     /// TUI, which treats a failed frame as a failed frame. No-op on
     /// terminals without image support.
     pub fn pump(&mut self, stdout: &mut impl Write, specs: &[PlacementSpec]) -> io::Result<()> {
-        if self.protocol != ImageProtocol::Kitty {
+        if self.protocol != ImageProtocol::UnicodePlaceholders {
             return Ok(());
         }
 
@@ -581,7 +601,7 @@ impl ImageCache {
         max_cols: u16,
         max_rows: u16,
     ) -> io::Result<bool> {
-        if self.protocol != ImageProtocol::Kitty {
+        if self.protocol != ImageProtocol::UnicodePlaceholders {
             return Ok(false);
         }
         let (id, width, height) = match self.view(url) {
@@ -651,7 +671,7 @@ impl ImageCache {
     /// our LRU (`d=I` via `pending_deletes`), keeping the terminal's copy
     /// bounded by `MAX_CACHED_IMAGES`.
     pub fn clear_terminal(&mut self, stdout: &mut impl Write) -> io::Result<()> {
-        if self.protocol != ImageProtocol::Kitty {
+        if self.protocol != ImageProtocol::UnicodePlaceholders {
             return Ok(());
         }
         self.flush_pending_deletes(stdout)?;
@@ -948,7 +968,7 @@ mod tests {
     #[test]
     fn poll_completed_stores_encoded_png_and_dimensions() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         let png = encode_png(&DynamicImage::new_rgb8(4, 4)).unwrap();
         let url = "https://x/encoded.png".to_string();
         cache.in_flight.insert(url.clone());
@@ -986,7 +1006,7 @@ mod tests {
     #[test]
     fn ensure_fetches_is_idempotent_for_known_urls() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         let url = "https://example.com/known-failed.png".to_string();
         // Pre-record the failure so the test exercises the failed-state
         // path: the entry makes `ensure_fetches` a no-op. (The harness
@@ -1009,7 +1029,7 @@ mod tests {
     #[test]
     fn lru_never_evicts_pinned_urls() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         let pinned = "https://x/pinned.png".to_string();
         cache.insert_ready_for_test(&pinned, 1, 8, 8, false);
         cache.set_pinned(HashSet::from([pinned.clone()]));
@@ -1038,7 +1058,7 @@ mod tests {
     #[test]
     fn lru_eviction_of_transmitted_image_queues_terminal_delete() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         cache.insert_ready_for_test("https://x/dropped.png", 4242, 8, 8, true);
 
         for i in 0..MAX_CACHED_IMAGES {
@@ -1061,12 +1081,46 @@ mod tests {
     // ── ImageCache ───────────────────────────────────────────────────────
 
     #[test]
+    fn protocol_detection_supports_kitty_and_ghostty_only() {
+        use ImageProtocol::*;
+        // `ImageProtocol::None` is glob-imported above, so spell the
+        // `Option` variant explicitly for the leading capability args.
+        assert_eq!(
+            protocol_for(false, true, Option::None, Option::None),
+            UnicodePlaceholders
+        );
+        assert_eq!(
+            protocol_for(false, false, Some("xterm-kitty"), Option::None),
+            UnicodePlaceholders
+        );
+        assert_eq!(
+            protocol_for(false, false, Some("xterm-ghostty"), Option::None),
+            UnicodePlaceholders
+        );
+        assert_eq!(
+            protocol_for(false, false, Some("xterm-256color"), Some("ghostty")),
+            UnicodePlaceholders
+        );
+        assert_eq!(
+            protocol_for(false, false, Some("xterm-256color"), Some("wezterm")),
+            None
+        );
+        assert_eq!(
+            protocol_for(true, true, Some("xterm-kitty"), Option::None),
+            None
+        );
+    }
+
+    #[test]
     fn detect_protocol_none_by_default() {
         // Env can poison this test if KITTY_WINDOW_ID is set in the parent.
         // We can't safely unset process-global env in a multi-threaded
         // test runner, so just assert the function returns *something*.
         let p = detect_protocol();
-        assert!(matches!(p, ImageProtocol::Kitty | ImageProtocol::None));
+        assert!(matches!(
+            p,
+            ImageProtocol::UnicodePlaceholders | ImageProtocol::None
+        ));
     }
 
     #[test]
@@ -1091,7 +1145,7 @@ mod tests {
     #[test]
     fn start_fetch_rejects_unsafe_urls() {
         let mut cache = ImageCache::new();
-        cache.protocol = ImageProtocol::Kitty;
+        cache.protocol = ImageProtocol::UnicodePlaceholders;
         // localhost / private IPs are blocked by is_safe_auto_url.
         assert!(cache.start_fetch("http://127.0.0.1/x.png"));
         // Recorded as a known failure so it isn't re-queued every tick.
@@ -1107,7 +1161,7 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_past_cap() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         for i in 0..MAX_CACHED_IMAGES + 3 {
             cache.insert_ready_for_test(&format!("https://x/{i}.png"), i as u32 + 1, 8, 8, false);
         }
@@ -1131,7 +1185,7 @@ mod tests {
     #[test]
     fn poll_completed_assigns_unique_ids() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         let png = encode_png(&DynamicImage::new_rgb8(8, 8)).unwrap();
         for url in ["a", "b"] {
             cache.in_flight.insert(url.to_string());
@@ -1189,7 +1243,7 @@ mod tests {
     /// Build a Kitty-mode cache with ready images already in place.
     fn cache_with_images(urls: &[&str]) -> ImageCache {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         for (i, url) in urls.iter().enumerate() {
             cache.insert_ready_for_test(url, i as u32 + 1, 8, 8, false);
         }
@@ -1329,7 +1383,7 @@ mod tests {
     #[test]
     fn pump_transmits_one_image_per_call_then_places_it() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         cache.insert_ready_for_test("a", 1, 40, 10, false);
         cache.insert_ready_for_test("b", 2, 40, 10, false);
         let specs = [spec("a", 40, 10), spec("b", 40, 10)];
@@ -1352,7 +1406,7 @@ mod tests {
     #[test]
     fn pump_replaces_virtual_placement_on_resize_without_retransmit() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         cache.insert_ready_for_test("a", 1, 40, 10, true);
         let mut out = Vec::new();
         cache.pump(&mut out, &[spec("a", 40, 10)]).unwrap();
@@ -1379,7 +1433,7 @@ mod tests {
     #[test]
     fn pump_frees_evicted_terminal_data() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         cache.insert_ready_for_test("https://x/old.png", 4242, 8, 8, true);
         // Push the transmitted image out of the LRU; eviction has no writer,
         // so the `d=I` is only queued.
@@ -1412,7 +1466,7 @@ mod tests {
     #[test]
     fn pump_pins_spec_urls_against_eviction() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         let urls: Vec<String> = (0..MAX_CACHED_IMAGES)
             .map(|i| format!("https://x/pinned-{i}.png"))
             .collect();
@@ -1443,7 +1497,7 @@ mod tests {
     #[test]
     fn pump_skips_ready_entry_that_lost_its_payload() {
         let mut cache = ImageCache::new();
-        cache.force_protocol(ImageProtocol::Kitty);
+        cache.force_protocol(ImageProtocol::UnicodePlaceholders);
         // Reachable after a transmit I/O error, and from test fixtures: the
         // entry is `Ready` but has no PNG to send. It must never be marked
         // transmitted or placed — the terminal has nothing to draw.
