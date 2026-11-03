@@ -35,7 +35,11 @@ const EXTRACTION_MAX_INFLIGHT: usize = 4;
 /// which would effectively turn the bound into "spawn as many workers as
 /// you want until the heap runs out".
 fn release_inflight_slot(counter: &AtomicUsize) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+    // `fetch_update` is deprecated in 1.99 (renamed `try_update`), but
+    // `try_update` is only stable since 1.95 and our MSRV is 1.75, so the
+    // deprecated form stays until the MSRV moves past that.
+    #[allow(deprecated)]
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
         Some(x.saturating_sub(1))
     });
 }
