@@ -1,6 +1,8 @@
 use crate::app::{find_article_matches, App, ArticleMatch, ExtractionState, InputMode};
 use crate::keybindings::{key_display, KeyAction};
-use crate::ui::utils::{count_wrapped_lines, format_content_for_reading, truncate_url};
+use crate::ui::utils::{
+    count_wrapped_lines, format_content_for_reading, truncate_str, truncate_url,
+};
 use crate::ui::ColorScheme;
 use ratatui::{
     backend::Backend,
@@ -10,6 +12,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Which body the detail view is currently showing. Owns its strings so
 /// the immutable borrow on `app.extracted` is released before we call any
@@ -21,6 +24,168 @@ enum BodySource {
     /// Failed extraction — body falls back to the summary, and `reason` is
     /// shown as a small dim hint above it.
     Failed(String),
+}
+
+/// Rows the article header occupies in compact mode: two border rows plus
+/// the title, plus one more for the metadata/link row when the item has
+/// either. Non-compact keeps its fixed 9-row header (see `render_item_detail`).
+fn compact_header_height(has_meta: bool, has_link: bool) -> u16 {
+    if has_meta || has_link {
+        4
+    } else {
+        3
+    }
+}
+
+/// Append `text` to `spans` only as far as the display width allows, and
+/// advance `used` by what was actually kept. Text that cannot fit is
+/// truncated with `truncate_str` when there is room for the ellipsis, and
+/// dropped otherwise — compact rows must never wrap into the body.
+fn push_clamped(
+    spans: &mut Vec<Span<'static>>,
+    used: &mut u16,
+    text: String,
+    style: Style,
+    width: u16,
+) {
+    let remaining = width.saturating_sub(*used);
+    if remaining == 0 {
+        return;
+    }
+    let text_width = UnicodeWidthStr::width(text.as_str()).min(u16::MAX as usize) as u16;
+    let kept = if text_width <= remaining {
+        text
+    } else if remaining > 3 {
+        truncate_str(&text, remaining as usize)
+    } else {
+        return;
+    };
+    *used =
+        used.saturating_add(UnicodeWidthStr::width(kept.as_str()).min(u16::MAX as usize) as u16);
+    spans.push(Span::styled(kept, style));
+}
+
+/// Build the article header lines.
+///
+/// Non-compact reproduces the historical five-row shape: title, blank,
+/// metadata, blank, link. Compact packs the title and a single
+/// metadata/link row, clamping every piece to `inner_width` (the text
+/// columns inside the block, borders and padding excluded) so the row can
+/// never wrap and push the body out.
+#[allow(clippy::too_many_arguments)]
+fn build_header_lines(
+    title: &str,
+    read_status: Option<bool>,
+    author: Option<&str>,
+    date: Option<&str>,
+    link: Option<&str>,
+    compact: bool,
+    inner_width: u16,
+    colors: &ColorScheme,
+) -> Vec<Line<'static>> {
+    let title_style = Style::default()
+        .fg(colors.text)
+        .add_modifier(Modifier::BOLD);
+    let title_text = if compact {
+        truncate_str(title, inner_width as usize)
+    } else {
+        title.to_string()
+    };
+
+    // Metadata in display order: read status, author, date.
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    if let Some(is_read) = read_status {
+        parts.push((
+            if is_read {
+                "✓ Read".to_string()
+            } else {
+                "○ Unread".to_string()
+            },
+            Style::default().fg(if is_read {
+                colors.success
+            } else {
+                colors.highlight
+            }),
+        ));
+    }
+    if let Some(author) = author {
+        parts.push((
+            author.to_string(),
+            Style::default()
+                .fg(colors.secondary)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    if let Some(date) = date {
+        parts.push((date.to_string(), Style::default().fg(colors.text_secondary)));
+    }
+
+    let separator_style = Style::default().fg(colors.muted);
+    let link_style = Style::default()
+        .fg(colors.primary)
+        .add_modifier(Modifier::UNDERLINED);
+
+    if !compact {
+        let mut lines = vec![
+            Line::from(vec![Span::styled(title_text, title_style)]),
+            Line::from(""),
+        ];
+        if !parts.is_empty() {
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() * 2);
+            for (idx, (text, style)) in parts.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(" · ", separator_style));
+                }
+                spans.push(Span::styled(text, style));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+        if let Some(link) = link {
+            lines.push(Line::from(vec![
+                Span::styled("🔗 ", separator_style),
+                Span::styled(truncate_url(link, 70), link_style),
+            ]));
+        }
+        return lines;
+    }
+
+    // Compact: one metadata/link row under the title.
+    const LINK_SEPARATOR: &str = " · ";
+    const LINK_ICON: &str = "🔗 ";
+    let mut lines = vec![Line::from(vec![Span::styled(title_text, title_style)])];
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() * 2 + 3);
+    let mut used: u16 = 0;
+    for (idx, (text, style)) in parts.into_iter().enumerate() {
+        if idx > 0 {
+            push_clamped(
+                &mut spans,
+                &mut used,
+                LINK_SEPARATOR.to_string(),
+                separator_style,
+                inner_width,
+            );
+        }
+        push_clamped(&mut spans, &mut used, text, style, inner_width);
+    }
+    if let Some(link) = link {
+        // Trailing " · 🔗 " plus at least a few URL columns, or the link is
+        // dropped rather than rendered as a bare "…".
+        let overhead = UnicodeWidthStr::width(LINK_SEPARATOR) + UnicodeWidthStr::width(LINK_ICON);
+        let remaining = inner_width.saturating_sub(used) as usize;
+        if remaining >= overhead + 8 {
+            spans.push(Span::styled(LINK_SEPARATOR, separator_style));
+            spans.push(Span::styled(LINK_ICON, separator_style));
+            spans.push(Span::styled(
+                truncate_url(link, remaining - overhead),
+                link_style,
+            ));
+        }
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 pub(super) fn render_item_detail<B: Backend>(
@@ -73,12 +238,33 @@ pub(super) fn render_item_detail<B: Backend>(
     if let Some(url) = &image_url {
         app.image_cache.start_fetch(url);
     }
+    // Header height: compact shrinks it to title + one metadata/link row
+    // plus borders (3 or 4 rows); non-compact keeps the historical 9. The
+    // two flags need only a short-lived immutable borrow so the `&mut app`
+    // writes above/below stay legal.
+    const HEADER_ROWS: u16 = 9;
+    let (has_header_meta, has_header_link) = app
+        .current_item()
+        .map(|item| {
+            (
+                item.author.is_some()
+                    || item.formatted_date.is_some()
+                    || (app.selected_feed.is_some() && app.selected_item.is_some()),
+                item.link.is_some(),
+            )
+        })
+        .unwrap_or((false, false));
+    let header_rows = if app.compact {
+        compact_header_height(has_header_meta, has_header_link)
+    } else {
+        HEADER_ROWS
+    };
     // Split the area into header, optional image strip, content, and
     // (optionally) a 1-row search footer. The footer is omitted when
     // in-article search is inactive so quiet reading is unchanged. The
     // split happens before the `item` borrow below so the *actual* strip
     // rect can be stored in `pending_image_render`.
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(9)]; // Header
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(header_rows)]; // Header
     if image_strip_rows > 0 {
         constraints.push(Constraint::Length(image_strip_rows));
     }
@@ -125,78 +311,23 @@ pub(super) fn render_item_detail<B: Backend>(
     };
 
     if let Some(item) = app.current_item() {
-        // Create header with enhanced typography
-        let mut header_lines = vec![
-            // Title with better emphasis
-            Line::from(vec![Span::styled(
-                &item.title,
-                Style::default()
-                    .fg(colors.text)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            // Add spacing after title
-            Line::from(""),
-        ];
-
-        // Build metadata line with enhanced formatting
-        let mut metadata_parts = Vec::new();
-
-        // Add read status with icon
-        if let (Some(feed_idx), Some(item_idx)) = (app.selected_feed, app.selected_item) {
-            let is_read = app.is_item_read(feed_idx, item_idx);
-            metadata_parts.push(Span::styled(
-                if is_read { "✓ Read" } else { "○ Unread" },
-                Style::default().fg(if is_read {
-                    colors.success
-                } else {
-                    colors.highlight
-                }),
-            ));
-        }
-
-        // Add author with emphasis
-        if let Some(author) = &item.author {
-            if !metadata_parts.is_empty() {
-                metadata_parts.push(Span::styled(" · ", Style::default().fg(colors.muted)));
-            }
-            metadata_parts.push(Span::styled(
-                author,
-                Style::default()
-                    .fg(colors.secondary)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-
-        // Add date
-        if let Some(date) = &item.formatted_date {
-            if !metadata_parts.is_empty() {
-                metadata_parts.push(Span::styled(" · ", Style::default().fg(colors.muted)));
-            }
-            metadata_parts.push(Span::styled(
-                date,
-                Style::default().fg(colors.text_secondary),
-            ));
-        }
-
-        if !metadata_parts.is_empty() {
-            header_lines.push(Line::from(metadata_parts));
-        }
-
-        // Add subtle separator before link
-        header_lines.push(Line::from(""));
-
-        // Add link if available with better styling
-        if let Some(link) = &item.link {
-            header_lines.push(Line::from(vec![
-                Span::styled("🔗 ", Style::default().fg(colors.muted)),
-                Span::styled(
-                    truncate_url(link, 70),
-                    Style::default()
-                        .fg(colors.primary)
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-            ]));
-        }
+        // Text columns inside the header block: borders (2) plus three
+        // columns of horizontal padding on each side.
+        let header_inner_width = chunks[0].width.saturating_sub(8);
+        let read_status = match (app.selected_feed, app.selected_item) {
+            (Some(feed_idx), Some(item_idx)) => Some(app.is_item_read(feed_idx, item_idx)),
+            _ => None,
+        };
+        let header_lines = build_header_lines(
+            &item.title,
+            read_status,
+            item.author.as_deref(),
+            item.formatted_date.as_deref(),
+            item.link.as_deref(),
+            app.compact,
+            header_inner_width,
+            colors,
+        );
 
         let article_icon = colors.get_icon_article();
         let header = Paragraph::new(header_lines)
@@ -208,7 +339,13 @@ pub(super) fn render_item_detail<B: Backend>(
                     .border_type(colors.border_normal)
                     .border_style(Style::default().fg(colors.border))
                     .style(Style::default().bg(colors.surface))
-                    .padding(Padding::new(3, 3, 1, 1)), // Increased horizontal padding
+                    // Compact drops the vertical padding: the header is
+                    // only 3-4 rows and the body needs them more.
+                    .padding(if app.compact {
+                        Padding::new(3, 3, 0, 0)
+                    } else {
+                        Padding::new(3, 3, 1, 1)
+                    }),
             )
             .style(Style::default().fg(colors.text))
             .alignment(Alignment::Left);
@@ -564,11 +701,107 @@ pub(super) fn build_styled_body<'a>(
 mod tests {
     use super::*;
     use crate::app::find_article_matches;
+    use unicode_width::UnicodeWidthStr;
 
     /// Extract the printable text of a `Line` so tests can assert content
     /// independent of span styling. Joins all span text in order.
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn compact_header_height_is_four_with_meta_or_link_and_three_without() {
+        assert_eq!(compact_header_height(false, false), 3);
+        assert_eq!(compact_header_height(true, false), 4);
+        assert_eq!(compact_header_height(false, true), 4);
+    }
+
+    #[test]
+    fn compact_header_builds_title_then_meta_and_link_on_one_row() {
+        let colors = ColorScheme::dark();
+        let lines = build_header_lines(
+            "Hello",
+            Some(false),
+            Some("Ada"),
+            Some("Nov 4"),
+            Some("https://example.com/a"),
+            true,
+            60,
+            &colors,
+        );
+        assert_eq!(lines.len(), 2);
+        let second = line_text(&lines[1]);
+        assert!(second.contains("Ada"), "got {second}");
+        assert!(second.contains("Nov 4"), "got {second}");
+        assert!(second.contains("example.com/a"), "got {second}");
+    }
+
+    #[test]
+    fn compact_header_collapses_to_one_line_without_meta_or_link() {
+        let colors = ColorScheme::dark();
+        let lines = build_header_lines("Hello", None, None, None, None, true, 60, &colors);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "Hello");
+    }
+
+    #[test]
+    fn compact_header_truncates_long_title_to_inner_width() {
+        let colors = ColorScheme::dark();
+        let title = "A".repeat(200);
+        let lines = build_header_lines(&title, None, None, None, None, true, 40, &colors);
+        assert!(UnicodeWidthStr::width(line_text(&lines[0]).as_str()) <= 40);
+    }
+
+    #[test]
+    fn compact_header_never_exceeds_inner_width_when_meta_fills_the_row() {
+        let colors = ColorScheme::dark();
+        let author = "A".repeat(60);
+        let lines = build_header_lines(
+            "T",
+            Some(false),
+            Some(&author),
+            Some("Nov 4"),
+            Some("https://example.com/a/very/long/path/that/should/not/fit"),
+            true,
+            40,
+            &colors,
+        );
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(line_text(line).as_str()) <= 40,
+                "line overflows: {}",
+                line_text(line)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_header_counts_wide_characters_by_display_width() {
+        let colors = ColorScheme::dark();
+        let title = "記事".repeat(40); // 80 display columns
+        let lines = build_header_lines(&title, None, None, None, None, true, 40, &colors);
+        assert!(UnicodeWidthStr::width(line_text(&lines[0]).as_str()) <= 40);
+    }
+
+    #[test]
+    fn non_compact_header_keeps_spacers_and_separate_link_row() {
+        let colors = ColorScheme::dark();
+        let lines = build_header_lines(
+            "Hello",
+            Some(true),
+            Some("Ada"),
+            Some("Nov 4"),
+            Some("https://example.com/a"),
+            false,
+            60,
+            &colors,
+        );
+        assert_eq!(lines.len(), 5);
+        assert_eq!(line_text(&lines[1]), "");
+        assert!(line_text(&lines[2]).contains("Ada"));
+        assert_eq!(line_text(&lines[3]), "");
+        assert!(line_text(&lines[4]).starts_with('\u{1F517}'));
+        assert!(!line_text(&lines[2]).contains("example.com"));
     }
 
     #[test]
