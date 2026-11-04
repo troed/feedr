@@ -1,4 +1,5 @@
 pub mod app;
+pub mod body;
 pub mod config;
 pub mod config_cli;
 pub mod config_tui;

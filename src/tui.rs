@@ -35,6 +35,10 @@ const EXTRACTION_MAX_INFLIGHT: usize = 4;
 /// which would effectively turn the bound into "spawn as many workers as
 /// you want until the heap runs out".
 fn release_inflight_slot(counter: &AtomicUsize) {
+    // `fetch_update` is deprecated in 1.99 (renamed `try_update`), but
+    // `try_update` is only stable since 1.95 and our MSRV is 1.75, so the
+    // deprecated form stays until the MSRV moves past that.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
         Some(x.saturating_sub(1))
     });
@@ -505,27 +509,29 @@ fn spawn_pending_extractions(
     }
 }
 
-/// Drain `app.pending_image_render` and emit Kitty graphics escapes to
-/// place the image at the reserved rect. On view-change (no pending image
-/// this frame but had one last frame), emit a clear-all so previous-frame
-/// placements don't bleed into the next view. Errors are swallowed — a
-/// failed image emit must never crash the TUI.
-fn emit_inline_image(app: &mut App) -> Result<()> {
-    use std::io::Write;
-    if let Some(pi) = app.pending_image_render.take() {
-        let mut stdout = io::stdout().lock();
-        let _ = app
-            .image_cache
-            .render_at(&mut stdout, &pi.url, pi.col, pi.row, pi.cols, pi.rows);
-        let _ = stdout.flush();
-        app.last_frame_had_image = true;
-    } else if app.last_frame_had_image {
-        let mut stdout = io::stdout().lock();
-        let _ = app.image_cache.clear_terminal(&mut stdout);
-        let _ = stdout.flush();
-        app.last_frame_had_image = false;
-    }
-    Ok(())
+/// Drive the inline-image cache for one frame: pin and re-place the images
+/// the detail view is about to draw, and transmit at most one image that is
+/// ready but not yet in the terminal's registry.
+///
+/// Must run *before* `terminal.draw`: a Kitty virtual placement draws nothing
+/// on its own, it only fills the cells the text buffer paints. Transmitting
+/// after the frame would leave the placeholders painted for a frame whose
+/// pixel data isn't there yet, so the image appears one frame late (or never,
+/// if the frame never re-renders).
+fn pump_images_with(app: &mut App, out: &mut impl Write) -> io::Result<()> {
+    app.image_cache.pump(out, &app.visible_image_specs)
+}
+
+/// `pump_images_with` against a locked stdout, flushed.
+///
+/// The flush is load-bearing: `terminal.draw` queues its own escapes on the
+/// same stream, and an unflushed image escape could be emitted after the
+/// placeholder cells it is meant to fill.
+fn pump_images(app: &mut App) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut locked = stdout.lock();
+    pump_images_with(app, &mut locked)?;
+    locked.flush()
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
@@ -558,19 +564,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
         // Drain any background-fetched inline images so the next render
         // can use them. Cheap (try_recv loop, no I/O).
         app.image_cache.poll_completed();
+        // Transmit/place whatever is ready before the frame that paints the
+        // placeholder cells: a virtual placement is invisible until the text
+        // buffer draws the cells it fills.
+        pump_images(app)?;
 
         terminal.draw(|f| {
             app.update_compact_mode(f.size().height);
             ui::render(f, app);
         })?;
-
-        // Inline-image post-pass. Runs AFTER `terminal.draw()` so all
-        // ratatui escapes have been flushed; emitting our Kitty escapes
-        // here paints them on top of the (intentionally blank) image
-        // strip the detail view reserved in `app.pending_image_render`.
-        // On view-change we emit `clear_terminal` so a previous frame's
-        // image doesn't bleed into a non-detail view.
-        emit_inline_image(app)?;
 
         // Check if a refresh was requested (by 'r' key or auto-refresh)
         if app.refresh_requested {
@@ -759,6 +761,57 @@ mod tests {
     }
 
     #[test]
+    fn pump_images_is_a_noop_on_none_protocol() {
+        let mut app = App::new();
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::None);
+        let mut out: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pump_images_transmits_ready_image_before_draw() {
+        // The TUI pumps between `poll_completed` and `terminal.draw`, so a
+        // ready image reaches the terminal before the frame that draws its
+        // placeholder cells. This exercises the helper that call site uses:
+        // one ready image + its placement spec must transmit, and the
+        // placement must be emitted in the same pass.
+        let mut app = App::new();
+        app.image_cache
+            .force_protocol(crate::image::ImageProtocol::UnicodePlaceholders);
+        app.image_cache
+            .insert_ready_for_test("https://ex.com/a.png", 7, 40, 10, false);
+        app.visible_image_specs.push(crate::image::PlacementSpec {
+            url: "https://ex.com/a.png".to_string(),
+            cols: 20,
+            rows: 10,
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut out).unwrap();
+        let written = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            written.contains("a=t,f=100,t=d,i=7"),
+            "ready image must be transmitted: {written:?}"
+        );
+        assert!(
+            written.contains("a=p,U=1,i=7"),
+            "the virtual placement must accompany the transmission: {written:?}"
+        );
+
+        // The transmit budget is one image per pump and the cells did not
+        // move, so the next pump (the next frame) writes nothing.
+        let mut again: Vec<u8> = Vec::new();
+        pump_images_with(&mut app, &mut again).unwrap();
+        assert!(
+            again.is_empty(),
+            "second pump must not retransmit: {:?}",
+            String::from_utf8_lossy(&again)
+        );
+    }
+
+    #[test]
     fn test_drain_halts_when_action_sets_error() {
         // A chain where step 1 errors must not run step 2. MoveUp is not
         // supported in macros (sets app.error to a "not supported" message);
@@ -929,106 +982,12 @@ mod tests {
                     parsed_date: None,
                     plain_text: None,
                     title_lower: title.to_lowercase(),
+                    prepared_body: None,
                     media: Vec::new(),
                     thumbnail: None,
                 })
                 .collect(),
         }
-    }
-
-    /// Regression lock: the Kitty escapes are emitted after
-    /// `terminal.draw()` returns, so a frame with a visible modal must not
-    /// queue an image placement — it would paint on top of the modal.
-    #[test]
-    fn test_modal_suppresses_pending_image_render() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let mut app = App::new();
-        let mut feed = build_feed_with_items(
-            "https://ex.com/feed.xml",
-            vec![("Post", Some("https://ex.com/a"))],
-        );
-        feed.items[0].thumbnail = Some("https://ex.com/t.png".to_string());
-        app.feeds.push(feed);
-        app.view = crate::app::View::FeedItemDetail;
-        app.selected_feed = Some(0);
-        app.selected_item = Some(0);
-        // Pretend the thumbnail is already decoded and the terminal speaks
-        // Kitty, so the detail renderer reserves the strip and queues a
-        // placement.
-        app.image_cache
-            .force_protocol(crate::image::ImageProtocol::Kitty);
-        app.image_cache.insert_image(
-            "https://ex.com/t.png".to_string(),
-            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
-        );
-
-        let backend = TestBackend::new(80, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(
-            app.pending_image_render.is_some(),
-            "modal-free frame should queue an image placement"
-        );
-
-        app.show_help_overlay = true;
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(
-            app.pending_image_render.is_none(),
-            "frame with a visible modal must not queue an image placement"
-        );
-
-        // Closing the modal restores the placement on the next frame.
-        app.show_help_overlay = false;
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(app.pending_image_render.is_some());
-    }
-
-    /// Regression lock: the 10-row image strip must give way to the
-    /// article body — no strip (and no placement) on short terminals or
-    /// in compact mode, where header + strip would squeeze the body to
-    /// near-zero rows.
-    #[test]
-    fn test_image_strip_suppressed_on_short_or_compact_terminals() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let mut app = App::new();
-        let mut feed = build_feed_with_items(
-            "https://ex.com/feed.xml",
-            vec![("Post", Some("https://ex.com/a"))],
-        );
-        feed.items[0].thumbnail = Some("https://ex.com/t.png".to_string());
-        app.feeds.push(feed);
-        app.view = crate::app::View::FeedItemDetail;
-        app.selected_feed = Some(0);
-        app.selected_item = Some(0);
-        app.image_cache
-            .force_protocol(crate::image::ImageProtocol::Kitty);
-        app.image_cache.insert_image(
-            "https://ex.com/t.png".to_string(),
-            Some(std::sync::Arc::new(image::DynamicImage::new_rgb8(100, 100))),
-        );
-
-        // Short terminal: detail area falls below the strip threshold.
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(
-            app.pending_image_render.is_none(),
-            "short terminal must not reserve the image strip"
-        );
-
-        // Tall terminal but compact mode forced on: also suppressed.
-        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
-        app.compact = true;
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(
-            app.pending_image_render.is_none(),
-            "compact mode must not reserve the image strip"
-        );
-
-        // Sanity: same tall terminal, compact off → strip + placement.
-        app.compact = false;
-        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(app.pending_image_render.is_some());
     }
 
     /// Regression lock: compact mode's article header is 3-4 rows, not the

@@ -1524,6 +1524,7 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::days(30)),
                         plain_text: Some("Old content".to_string()),
+                        prepared_body: None,
                         media: Vec::new(),
                         thumbnail: None,
                     },
@@ -1537,6 +1538,7 @@ mod tests {
                         formatted_date: None,
                         parsed_date: Some(Utc::now() - chrono::Duration::hours(1)),
                         plain_text: Some("New content".to_string()),
+                        prepared_body: None,
                         media: Vec::new(),
                         thumbnail: None,
                     },
@@ -1556,6 +1558,7 @@ mod tests {
                     formatted_date: None,
                     parsed_date: Some(Utc::now() - chrono::Duration::hours(2)),
                     plain_text: Some("Another new content".to_string()),
+                    prepared_body: None,
                     media: Vec::new(),
                     thumbnail: None,
                 }],
@@ -2248,7 +2251,6 @@ mod tests {
             },
         ];
         app.article_body_cache = "foo line\nbar foo line".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_current = Some(0);
 
         let n = make_key(KeyCode::Char('n'), KeyModifiers::NONE);
@@ -2275,7 +2277,6 @@ mod tests {
             },
         ];
         app.article_body_cache = "foo line\nbar foo line".to_string();
-        app.article_body_width_cache = 80;
         app.article_search_current = Some(1);
 
         let big_n = make_key(KeyCode::Char('N'), KeyModifiers::SHIFT);

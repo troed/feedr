@@ -25,7 +25,7 @@ Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provi
 - **Article Preview**: Toggle an inline preview pane in the dashboard view, or have it open at launch with `show_preview = true`
 - **Link Extraction**: Extract and browse all links from an article with `l`
 - **Full-Text Extraction**: Strip away summaries and read the actual article content inline via Mozilla Readability — manual on `Shift+F`, or auto-extract on refresh per feed with `fulltext = true`
-- **Inline Images**: When an article has a `<media:thumbnail>` (e.g. YouTube channel feeds, web-comic RSS), Feedr renders it inline in the detail view via the Kitty graphics protocol. Auto-detected on Ghostty, Kitty, and WezTerm; silently no-ops elsewhere. Images are fetched in the background — read or open in browser without waiting.
+- **Inline Images**: Every block-level image in the article body renders at its position via the Kitty graphics protocol's Unicode placeholders. Requires Kitty >= 0.28 or Ghostty. WezTerm and tmux show the image's alt text. Inline (mid-sentence) images and the full-text extracted view are not rendered as images yet.
 - **Help Overlay**: Press `?` for a scrollable keybinding reference overlay
 - **OPML Import**: Bulk import feeds from OPML files via `feedr --import <file.opml>`
 - **Browser Integration**: Open articles in your default browser
