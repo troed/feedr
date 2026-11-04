@@ -1031,6 +1031,73 @@ mod tests {
         assert!(app.pending_image_render.is_some());
     }
 
+    /// Regression lock: compact mode's article header is 3-4 rows, not the
+    /// historical 9, and the freed rows go to the body. Rendered here rather
+    /// than in `ui::detail` because this module already owns the App/Feed
+    /// fixture the layout needs.
+    #[test]
+    fn test_compact_detail_header_is_short_and_gives_rows_to_the_body() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        /// One string per rendered terminal row.
+        fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            let width = buffer.area.width as usize;
+            buffer
+                .content
+                .chunks(width)
+                .map(|row| row.iter().map(|c| c.symbol.as_str()).collect::<String>())
+                .collect()
+        }
+
+        let mut app = App::new();
+        let mut feed = build_feed_with_items(
+            "https://ex.com/feed.xml",
+            vec![("Post", Some("https://ex.com/a"))],
+        );
+        feed.items[0].author = Some("Ada".to_string());
+        feed.items[0].formatted_date = Some("Nov 4".to_string());
+        app.feeds.push(feed);
+        app.view = crate::app::View::FeedItemDetail;
+        app.selected_feed = Some(0);
+        app.selected_item = Some(0);
+
+        // Compact: the one-row title bar owns row 0, so with a 4-row header
+        // the body block's titled top border lands on row 5. 24x20 and
+        // 24x40 are the widths the plan names; 24x12 is the narrowest case
+        // that used to split a wide character inside `truncate_str`.
+        app.compact = true;
+        for (width, height) in [(80, 24), (24, 40), (24, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let compact_body_top = rendered_rows(&terminal)
+                .iter()
+                .position(|row| row.contains("Summary"))
+                .expect("body block title should be rendered");
+            assert_eq!(
+                compact_body_top,
+                1 + 4,
+                "compact header must cost the detail view 4 rows at {width}x{height}"
+            );
+        }
+
+        // Degenerate width: the header must render, not panic mid-character.
+        let mut terminal = Terminal::new(TestBackend::new(12, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(rendered_rows(&terminal).len(), 24);
+
+        // Non-compact 80x40: outer margin (1) + title bar (4) puts the
+        // detail area at row 5; the 9-row header puts the body at row 14.
+        app.compact = false;
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let full_body_top = rendered_rows(&terminal)
+            .iter()
+            .position(|row| row.contains("Summary"))
+            .expect("body block title should be rendered");
+        assert_eq!(full_body_top, 5 + 9, "non-compact header must stay 9 rows");
+    }
+
     #[test]
     fn test_enqueue_fulltext_for_new_skips_when_feed_not_opted_in() {
         let mut app = App::new();
