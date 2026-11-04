@@ -1062,20 +1062,29 @@ mod tests {
         app.selected_feed = Some(0);
         app.selected_item = Some(0);
 
-        // Compact 80x24: the one-row title bar owns row 0, so with a 4-row
-        // header the body block's titled top border lands on row 5.
+        // Compact: the one-row title bar owns row 0, so with a 4-row header
+        // the body block's titled top border lands on row 5. 24x20 and
+        // 24x40 are the widths the plan names; 24x12 is the narrowest case
+        // that used to split a wide character inside `truncate_str`.
         app.compact = true;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for (width, height) in [(80, 24), (24, 40), (24, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let compact_body_top = rendered_rows(&terminal)
+                .iter()
+                .position(|row| row.contains("Summary"))
+                .expect("body block title should be rendered");
+            assert_eq!(
+                compact_body_top,
+                1 + 4,
+                "compact header must cost the detail view 4 rows at {width}x{height}"
+            );
+        }
+
+        // Degenerate width: the header must render, not panic mid-character.
+        let mut terminal = Terminal::new(TestBackend::new(12, 24)).unwrap();
         terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let compact_body_top = rendered_rows(&terminal)
-            .iter()
-            .position(|row| row.contains("Summary"))
-            .expect("body block title should be rendered");
-        assert_eq!(
-            compact_body_top,
-            1 + 4,
-            "compact header must cost the detail view 4 rows"
-        );
+        assert_eq!(rendered_rows(&terminal).len(), 24);
 
         // Non-compact 80x40: outer margin (1) + title bar (4) puts the
         // detail area at row 5; the 9-row header puts the body at row 14.

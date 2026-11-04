@@ -32,28 +32,26 @@ pub(crate) fn truncate_url(url: &str, max_length: usize) -> String {
 // Helper function to truncate a string with unicode awareness
 pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.width() <= max_chars {
-        s.to_string()
-    } else {
-        // Find position to truncate while respecting unicode boundaries
-        let mut total_width = 0;
-        let mut truncate_idx = 0;
-
-        for (idx, c) in s.char_indices() {
-            let char_width = c.width_cjk().unwrap_or(1);
-            if total_width + char_width > max_chars.saturating_sub(3) {
-                truncate_idx = idx;
-                break;
-            }
-            total_width += char_width;
-        }
-
-        if truncate_idx > 0 {
-            format!("{}...", &s[..truncate_idx])
-        } else {
-            // Fallback if we couldn't properly calculate (shouldn't happen often)
-            format!("{}...", &s[..max_chars.saturating_sub(3)])
-        }
+        return s.to_string();
     }
+    // No room for anything but the ellipsis (three columns of it).
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    // Walk characters, never bytes: `cut` only ever lands on a char
+    // boundary, so a wide first character can't produce a mid-slice panic.
+    let budget = max_chars - 3;
+    let mut total_width = 0;
+    let mut cut = 0;
+    for (idx, c) in s.char_indices() {
+        let char_width = c.width_cjk().unwrap_or(1);
+        if total_width + char_width > budget {
+            break;
+        }
+        total_width += char_width;
+        cut = idx + c.len_utf8();
+    }
+    format!("{}...", &s[..cut])
 }
 
 // Helper function to format content for better reading experience
@@ -156,4 +154,30 @@ pub(crate) fn count_wrapped_lines(text: &str, width: usize) -> u16 {
     // If text doesn't end with newline, we still have the lines we counted
     // If text is empty, return at least 1 line
     line_count.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_str_wide_first_char_at_tiny_width_stays_on_char_boundaries() {
+        // '○' is three bytes wide and two columns wide, so a 4-column
+        // budget leaves room only for the ellipsis.
+        assert_eq!(truncate_str("○ Unread", 4), "...");
+        assert_eq!(truncate_str("記事ABC", 4), "...");
+    }
+
+    #[test]
+    fn truncate_str_never_exceeds_the_requested_display_width() {
+        for max_chars in 0..=40 {
+            let out = truncate_str("記事 evening ○ wide", max_chars);
+            assert!(
+                out.width() <= max_chars,
+                "max {max_chars} produced {:?} ({} columns)",
+                out,
+                out.width()
+            );
+        }
+    }
 }

@@ -784,6 +784,33 @@ mod tests {
     }
 
     #[test]
+    fn compact_header_fits_the_inner_width_at_every_width_from_zero_to_sixty() {
+        let colors = ColorScheme::dark();
+        let author = "Ada Lovelace and the Analytical Engine ".repeat(2);
+        let title = "記事 ".repeat(30);
+        let link = "https://example.com/a/very/long/path/that/keeps/going";
+        for inner_width in 0..=60u16 {
+            let lines = build_header_lines(
+                &title,
+                Some(false),
+                Some(&author),
+                Some("Nov 4, 2026"),
+                Some(link),
+                true,
+                inner_width,
+                &colors,
+            );
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line_text(line).as_str()) <= inner_width as usize,
+                    "inner_width {inner_width}: {:?} overflows",
+                    line_text(line)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn non_compact_header_keeps_spacers_and_separate_link_row() {
         let colors = ColorScheme::dark();
         let lines = build_header_lines(
