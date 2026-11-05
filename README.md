@@ -1,3 +1,11 @@
+# This fork's differences to upstream
+
+- Inline images are rendered and scrolled in place
+- Compact mode also compacts article headers when reading
+- Words wrap correctly when reading articles
+
+Upstream's README follows:
+
 # Feedr - Terminal RSS Feed Reader 📰
 
 Feedr is a feature-rich terminal-based RSS feed reader written in Rust. It provides a clean, intuitive TUI interface for managing and reading RSS feeds with elegant visuals and smooth keyboard navigation.
