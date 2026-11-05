@@ -89,11 +89,12 @@ impl BodyLayout {
 /// Split one logical line into rows as byte ranges.
 ///
 /// Rows are at most `width` terminal cells wide, measured with
-/// `unicode_width` (so CJK characters count as two cells). A break at
-/// whitespace consumes the whole whitespace run, so the whitespace belongs to
-/// neither row. Words longer than a row are broken at the width, and a single
-/// character wider than the row gets a row of its own. A width of 0 keeps the
-/// whole line in one row; blank input yields one empty row.
+/// `unicode_width` (so CJK characters count as two cells). A word that would
+/// cross the row edge moves to the next row whole, and the whitespace run it
+/// leaves behind belongs to neither row. Only a word wider than a whole row is
+/// broken at the width, and a single character wider than the row gets a row
+/// of its own. A width of 0 keeps the whole line in one row; blank input
+/// yields one empty row.
 pub(crate) fn wrap_line(line: &str, width: usize) -> Vec<(usize, usize)> {
     if width == 0 {
         return vec![(0, line.len())];
@@ -104,59 +105,82 @@ pub(crate) fn wrap_line(line: &str, width: usize) -> Vec<(usize, usize)> {
 
     let mut rows = Vec::new();
     let mut row_start = 0usize;
-    let mut cells = 0usize;
-    // Byte offset of the start of the trailing whitespace run, if the byte
-    // before the current one was whitespace. Because it is reset on every
-    // non-whitespace char, "still pending" at byte `idx` means `idx` is the
-    // first byte after the run.
-    let mut pending_space: Option<usize> = None;
 
-    for (idx, ch) in line.char_indices() {
-        let cell_width = ch.width().unwrap_or(0);
+    while row_start < line.len() {
+        let mut cells = 0usize;
+        // Set once visible text is on this row. Whitespace before the first
+        // word is indentation, not a break opportunity.
+        let mut seen_text = false;
+        // Byte offset where the current whitespace run started, if the run
+        // follows visible text.
+        let mut pending_space: Option<usize> = None;
+        // Byte ranges of the most recent break opportunity: the start of the
+        // whitespace run before a word, and that word's start.
+        let mut last_break: Option<(usize, usize)> = None;
+        let mut overflow: Option<usize> = None;
 
-        if ch.is_whitespace() {
-            if pending_space.is_none() {
-                pending_space = Some(idx);
+        for (offset, ch) in line[row_start..].char_indices() {
+            let idx = row_start + offset;
+            let cell_width = ch.width().unwrap_or(0);
+
+            if ch.is_whitespace() {
+                if seen_text && pending_space.is_none() {
+                    pending_space = Some(idx);
+                }
+                cells = cells.saturating_add(cell_width);
+                continue;
             }
+
+            // A word starts here: the whitespace run that just ended is the
+            // latest place this row may break.
+            if let Some(space_start) = pending_space.take() {
+                last_break = Some((space_start, idx));
+            }
+
+            if cells.saturating_add(cell_width) > width {
+                overflow = Some(idx);
+                break;
+            }
+
+            seen_text = true;
             cells = cells.saturating_add(cell_width);
+        }
+
+        let Some(idx) = overflow else {
+            // The rest of the line fits: trailing whitespace is not part of
+            // any row.
+            let end = row_start + line[row_start..].trim_end().len();
+            rows.push((row_start, end.max(row_start)));
+            break;
+        };
+
+        // Break before the word that did not fit, keeping the word whole for
+        // the next row and consuming the whitespace run that preceded it.
+        if let Some((space_start, word_start)) = last_break {
+            rows.push((row_start, space_start));
+            row_start = word_start;
             continue;
         }
 
-        if cell_width > 0 && cells.saturating_add(cell_width) > width && idx > row_start {
-            match pending_space.take() {
-                // Break at the last whitespace that fits and consume it.
-                Some(space_start) if space_start > row_start => {
-                    rows.push((row_start, space_start));
-                }
-                // The row is only leading whitespace: keep the indentation
-                // with the first row rather than emitting an empty one.
-                _ => rows.push((row_start, idx)),
-            }
-            row_start = idx;
-            cells = 0;
+        // No earlier word to break before: this row is one unbreakable run,
+        // either indentation plus a long word or a long word alone.
+        if idx > row_start {
+            rows.push((row_start, idx));
         }
-
-        if cell_width > width {
+        let ch = line[idx..].chars().next().unwrap_or(' ');
+        if ch.width().unwrap_or(0) > width {
             // Wider than a whole row on its own: it cannot share with
             // anything, so give it its own row.
             rows.push((idx, idx + ch.len_utf8()));
             row_start = idx + ch.len_utf8();
-            cells = 0;
-            pending_space = None;
-            continue;
+        } else {
+            row_start = idx;
         }
-
-        pending_space = None;
-        cells = cells.saturating_add(cell_width);
     }
 
-    // Trailing whitespace is not part of any row.
-    match pending_space {
-        Some(space_start) if space_start > row_start => rows.push((row_start, space_start)),
-        Some(_) => rows.push((row_start, row_start)),
-        None => rows.push((row_start, line.len())),
+    if rows.is_empty() {
+        rows.push((0, 0));
     }
-
     rows
 }
 
@@ -297,6 +321,26 @@ mod tests {
         // this yields two rows. The plan's draft expected a third
         // `(16, 19)` row, which no greedy width-aware wrapper produces.
         assert_eq!(wrap_line("the quick brown fox", 10), vec![(0, 9), (10, 19)]);
+    }
+
+    #[test]
+    fn wrap_line_keeps_a_word_whole_when_it_straddles_the_edge() {
+        // "Hello wonderful" is 15 cells, so the word crossing the 12-cell edge
+        // moves to the next row instead of splitting at "wonder|ful".
+        assert_eq!(
+            wrap_line("Hello wonderful world", 12),
+            vec![(0, 5), (6, 15), (16, 21)]
+        );
+        // "one two th" would be exactly 10 cells if the row were filled by
+        // character, but "three" starts at column 8 and only "th" fits.
+        assert_eq!(wrap_line("one two three four", 10), vec![(0, 7), (8, 18)]);
+    }
+
+    #[test]
+    fn wrap_line_keeps_leading_indentation_with_an_overflowing_first_word() {
+        // Leading whitespace is never a break opportunity: the indentation
+        // stays on the first row rather than becoming a row of its own.
+        assert_eq!(wrap_line("    abcdefgh", 6), vec![(0, 6), (6, 12)]);
     }
 
     #[test]
